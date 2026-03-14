@@ -7,5 +7,4 @@ setup(
     install_requires=[],
     entry_points={'console_scripts': ['hashitout=hashitout:main']},
     python_requires='>=3.7',
-    description='Elite decoder, reversing tool, stego scanner and URL content analyzer',
 )
