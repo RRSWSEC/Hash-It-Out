@@ -181,19 +181,19 @@ def print_file_saved(filepath: str, method: str, filetype: str):
     print(f"      {C.TOXGRN}Saved to : {filepath}{C.RESET}")
 
 
-def generate_text_report(findings: list, source: str,
-                          input_data: str, saved_files: list = None) -> str:
+def generate_text_report(findings, source_label, input_preview, saved_files):
+    import datetime
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     lines = [
         '=' * 72,
         '  HASH IT OUT v3  -  ANALYSIS REPORT',
         f'  Generated : {ts}',
         f'  Source    : {source_label}',
-        f'  Input Len : {len(input_data)} characters',
+        f'  Input Len : {len(input_preview)} characters',
         '=' * 72,
         '',
         'INPUT (first 200 chars):',
-        input_data[:200] + ('...' if len(input_data) > 200 else ''),
+        input_preview[:200] + ('...' if len(input_preview) > 200 else ''),
         '',
         '─' * 72,
         'SUMMARY:',
