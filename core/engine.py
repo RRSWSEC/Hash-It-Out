@@ -61,8 +61,54 @@ class Finding:
         return '[no output]'
 
 
+import urllib.request
+import urllib.error
+import urllib.parse
+import re
+
+MAX_URL_BYTES = 10 * 1024 * 1024
+URL_TIMEOUT = 20
+
+
+class FetchResult:
+    __slots__ = ('url', 'raw_bytes', 'text', 'content_type', 'headers', 'status', 'error', 'is_binary', 'detected_type', 'final_url')
+    def __init__(self):
+        self.url = ''; self.raw_bytes = b''; self.text = ''
+        self.content_type = ''; self.headers = {}; self.status = 0
+        self.error = ''; self.is_binary = False
+        self.detected_type = None; self.final_url = ''
+
+
+def fetch_url(url: str):
+    result = FetchResult()
+    result.url = url
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url; result.url = url
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0','Accept-Encoding':'identity'})
+        with urllib.request.urlopen(req, timeout=URL_TIMEOUT) as resp:
+            result.status = resp.getcode()
+            result.content_type = resp.headers.get('Content-Type', '')
+            result.headers = dict(resp.headers)
+            result.final_url = resp.geturl()
+            result.raw_bytes = resp.read(MAX_URL_BYTES)
+    except urllib.error.HTTPError as e:
+        result.error = f'HTTP {e.code}'; result.status = e.code; return result
+    except Exception as e:
+        result.error = str(e); return result
+    result.detected_type = detect_filetype(result.raw_bytes)
+    ct = result.content_type.lower()
+    is_text = any(x in ct for x in ('text/','json','xml','html','plain'))
+    if is_text:
+        result.is_binary = False
+        result.text = result.raw_bytes.decode('utf-8', errors='replace')
+    else:
+        result.is_binary = True
+        result.text = result.raw_bytes.decode('latin-1')
+    return result
+
 class AnalysisEngine:
-    def __init__(self, wordlist: set = None, output_dir: str = './output',
+    def __init__(self, wordlist: set = None, output_dir: str = './output', max_depth: int = 3, stegopw_wordlist: str = None,
                  verbose: bool = True, flags: dict = None):
         self.wordlist = wordlist or set()
         self.output_dir = output_dir
