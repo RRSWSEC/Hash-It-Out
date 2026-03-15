@@ -43,7 +43,7 @@ def print_banner():
 {C.RESET}
 {C.MELT}  <<<====[ H.A.S.H  I.T  O.U.T ]====>>>{C.RESET}
 {C.SLIME}  ||| d3c0d3r . r3v3rs3r . f1l3 r3bu1ld3r |||{C.RESET}
-{C.DRIP}  >|> 5739o . v3.0.0 . github.com/RRSWSEC/hoi <|<{C.RESET}
+{C.DRIP}  >|> 5739o . v4.0.0 . github.com/RRSWSEC/Hash-It-Out <|<{C.RESET}
 {C.ACID}  +======================================================+
   |  {C.YELLOW}for educational and authorized research use only{C.ACID}  |
   +======================================================+{C.RESET}
@@ -112,14 +112,14 @@ AI-assisted filtering: hashitout-ai (coming soon){C.RESET}
 """)
 
 
-def print_results(findings: list, source: str, input_len: int, verbose: bool = True):
+def print_results(findings, source_label, input_size, verbose=True, nocolor=False, max_display=100):
     high   = [f for f in findings if f.confidence == 'HIGH']
     medium = [f for f in findings if f.confidence == 'MEDIUM']
     low    = [f for f in findings if f.confidence == 'LOW']
 
-    bar = '─' * max(0, 44 - len(source))
-    print(f"\n{C.CYAN}{C.BOLD}┌─[ RESULTS :: {source} ]{bar}┐{C.RESET}")
-    print(f"  {C.WHITE}Input length     : {input_len}{C.RESET}")
+    bar = '─' * max(0, 44 - len(source_label))
+    print(f"\n{C.CYAN}{C.BOLD}┌─[ RESULTS :: {source_label} ]{bar}┐{C.RESET}")
+    print(f"  {C.WHITE}Input length     : {input_size}{C.RESET}")
     print(f"  {C.GREEN}High confidence  : {len(high)}{C.RESET}")
     print(f"  {C.YELLOW}Medium confidence: {len(medium)}{C.RESET}")
     print(f"  {C.DIM}Low confidence   : {len(low)}{C.RESET}")
@@ -145,12 +145,12 @@ def print_results(findings: list, source: str, input_len: int, verbose: bool = T
             _print_finding(f, i + len(high))
 
     if low:
-        print(f"\n{C.DIM}┌─[ LOW CONFIDENCE ]{'·' * 53}┐{C.RESET}")
+        print(f"\n{C.DIM}┌─[ LOW CONFIDENCE ]{'*' * 53}┐{C.RESET}")
         if len(low) <= 4:
             for i, f in enumerate(low, 1):
                 _print_finding(f, i + len(high) + len(medium))
         else:
-            print(f"  {C.DIM}({len(low)} low-confidence results — see report file){C.RESET}")
+            print(f"  {C.DIM}({len(low)} low-confidence results  -  see report file){C.RESET}")
 
 
 def _print_finding(f, index: int):
@@ -186,9 +186,9 @@ def generate_text_report(findings: list, source: str,
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     lines = [
         '=' * 72,
-        '  HASH IT OUT v3 — ANALYSIS REPORT',
+        '  HASH IT OUT v3  -  ANALYSIS REPORT',
         f'  Generated : {ts}',
-        f'  Source    : {source}',
+        f'  Source    : {source_label}',
         f'  Input Len : {len(input_data)} characters',
         '=' * 72,
         '',
@@ -228,7 +228,7 @@ def generate_text_report(findings: list, source: str,
                 if len(f.result_text) > 1000:
                     lines.append(f'       ... [{len(f.result_text)} chars total]')
             else:
-                lines.append('     Output    : [non-printable — see saved file]')
+                lines.append('     Output    : [non-printable  -  see saved file]')
         elif f.result_bytes:
             lines.append(f'     Output    : [binary] {bytes_to_hex_display(f.result_bytes, 32)}')
         lines.append('')
@@ -251,7 +251,7 @@ def generate_text_report(findings: list, source: str,
 
     lines += [
         '=' * 72,
-        'Hash It Out v3.0.0  —  github.com/RRSWSEC/hoi',
+        'Hash It Out v4.0.0   -   github.com/RRSWSEC/Hash-It-Out',
         '=' * 72,
     ]
     return '\n'.join(lines)
@@ -275,3 +275,31 @@ def save_decoded_file(data: bytes, output_dir: str, method: str,
     with open(filepath, 'wb') as fh:
         fh.write(data)
     return filepath
+
+def print_url_header(url, status, content_type, size, error=''):
+    if error:
+        print(f"  \033[91m[!] Fetch failed: {error}\033[0m"); return
+    print(f"\033[96m[*] Status   : {status}\033[0m")
+    print(f"\033[96m[*] Type     : {content_type}\033[0m")
+    print(f"\033[96m[*] Size     : {size:,} bytes\033[0m")
+
+def results_to_json(findings, source_label):
+    import datetime
+    return {'source': source_label, 'timestamp': datetime.datetime.now().isoformat(),
+            'total': len(findings), 'findings': [
+                {'method': f.method, 'confidence': f.confidence, 'note': f.note,
+                 'result_text': f.result_text[:2000] if f.result_text else None}
+                for f in findings]}
+
+def save_csv_report(findings, source_label, output_dir):
+    import csv, datetime, os, re
+    os.makedirs(output_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    path = os.path.join(output_dir, f'hio_findings_{ts}.csv')
+    with open(path, 'w', newline='', encoding='utf-8', errors='replace') as fh:
+        w = csv.writer(fh)
+        w.writerow(['confidence','method','source','note','result_preview'])
+        for f in findings:
+            w.writerow([f.confidence, f.method, f.source_label or source_label,
+                        (f.note or '')[:200], (f.result_text or '')[:200]])
+    return path
