@@ -1,7 +1,7 @@
 """
 core/decoders.py - All reversible decoders for Hash It Out v3
 Base2-Base92, all ROTs, classical ciphers, CTF staples, misc encodings.
-Zero external dependencies — Python 3.7+ stdlib only.
+Zero external dependencies  -  Python 3.7+ stdlib only.
 """
 
 import base64
@@ -19,7 +19,7 @@ from typing import Optional, List, Tuple
 def rot_n(text: str, n: int) -> str:
     result = []
     for ch in text:
-        if ch.isalpha():
+        if ch.isascii() and ch.isalpha():
             base = ord('A') if ch.isupper() else ord('a')
             result.append(chr((ord(ch) - base + n) % 26 + base))
         else:
@@ -419,7 +419,7 @@ def decode_morse(data: str) -> Optional[str]:
 def decode_atbash(text: str) -> str:
     result = []
     for ch in text:
-        if ch.isalpha():
+        if ch.isascii() and ch.isalpha():
             if ch.isupper():
                 result.append(chr(ord('Z') - (ord(ch) - ord('A'))))
             else:
@@ -439,7 +439,7 @@ def decode_vigenere(text: str, key: str) -> str:
     result = []
     ki = 0
     for ch in text:
-        if ch.isalpha():
+        if ch.isascii() and ch.isalpha():
             shift = ord(key[ki % len(key)]) - ord('a')
             base = ord('A') if ch.isupper() else ord('a')
             result.append(chr((ord(ch) - base - shift) % 26 + base))
@@ -462,7 +462,7 @@ def decode_affine(text: str, a: int, b: int) -> str:
             return text
         result = []
         for ch in text:
-            if ch.isalpha():
+            if ch.isascii() and ch.isalpha():
                 base = ord('A') if ch.isupper() else ord('a')
                 result.append(chr((a_inv * (ord(ch) - base - b)) % 26 + base))
             else:
