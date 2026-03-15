@@ -110,7 +110,7 @@ def detect_filetype(data: bytes) -> Optional[Tuple[str, str]]:
 def find_embedded_files(data: bytes) -> List[Tuple[int, str, str]]:
     """
     Scan entire binary for file signatures at any offset.
-    Catches files hidden/appended inside other files — core CTF technique.
+    Catches files hidden/appended inside other files  -  core CTF technique.
     """
     found = []
     limit = min(len(data), 100_000_000)
