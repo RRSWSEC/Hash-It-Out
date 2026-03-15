@@ -123,7 +123,7 @@ class FileCarver:
 def format_carve_tree(hits,indent=0):
     lines=[]; prefix='  '*indent
     for i,hit in enumerate(hits):
-        c='└─' if i==len(hits)-1 else '├
+        c='L-' if i==len(hits)-1 else '+-'
         lines.append(f'{prefix}{c} [{hit.label}] @ r{hit.offset:x}')
         if hit.children: lines.append(format_carve_tree(hit.children,indent+1))
     return '\n'.join(lines)

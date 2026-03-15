@@ -1,0 +1,2 @@
+[console_scripts]
+hashitout = hashitout:main

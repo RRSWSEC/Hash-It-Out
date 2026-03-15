@@ -1,0 +1,9 @@
+Metadata-Version: 2.1
+Name: hashitout
+Version: 4.1.0
+Summary: elite decoder, reverser, file rebuilder, stego scanner, and URL content analyzer
+Home-page: https://github.com/RRSWSEC/Hash-It-Out
+Author: spex
+Author-email: operations@rapidriverskunk.works
+Requires-Python: >=3.7
+Provides-Extra: stego

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+output/
+output.tar.gz
+.DS_Store
+hashitout.egg-info/
