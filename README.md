@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/RRSWSEC/hashitout/main/.github/avenatwork.png" width="300">
+</p>
 # Hash It Out (HIO)
 
 *i'm just gonna go live.... I can't keep dogging on this poor thing. We want you('re fingers and brain)! See CONTRIBUTING.md*
