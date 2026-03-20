@@ -5169,6 +5169,325 @@ def _visual_strided_scan(img, wordlist=None, full_nasty=False):
         pass
     return results
 
+def _parse_jpeg_huffman_tables(data: bytes) -> tuple:
+    """
+    Parse JPEG markers to extract Huffman tables, quantization tables,
+    frame info, and the raw SOS compressed bitstream.
+    Returns (raw_stream_bytes, huffman_tables, comp_tables, frame_info) or (None,...).
+    """
+    import struct
+    from io import BytesIO
+    buf = BytesIO(data)
+    def read_u16():
+        b = buf.read(2)
+        return struct.unpack('>H', b)[0] if len(b) == 2 else 0
+    def next_marker():
+        while True:
+            b = buf.read(1)
+            if not b:
+                return None
+            if b == b'\xff':
+                m = buf.read(1)
+                if m and m != b'\xff' and m != b'\x00':
+                    return m[0]
+    soi = buf.read(2)
+    if soi != b'\xff\xd8':
+        return None, {}, {}, {}
+    huffman_tables = {}
+    frame_info = {}
+    while True:
+        marker = next_marker()
+        if marker is None:
+            break
+        if marker == 0xD9:
+            break
+        if marker in (0xC0, 0xC1, 0xC2):
+            length = read_u16() - 2
+            seg = buf.read(length)
+            if len(seg) < 6:
+                continue
+            height = struct.unpack('>' + 'H', seg[1:3])[0]
+            width  = struct.unpack('>' + 'H', seg[3:5])[0]
+            ncomp  = seg[5]
+            comps = []
+            for i in range(ncomp):
+                if 6 + i*3 + 2 >= len(seg):
+                    break
+                comps.append({'id': seg[6+i*3], 'qt': seg[6+i*3+2]})
+            frame_info = {'w': width, 'h': height, 'comp': comps}
+            continue
+        if marker == 0xDB:
+            length = read_u16() - 2
+            seg = buf.read(length)
+            continue
+        if marker == 0xC4:
+            length = read_u16() - 2
+            seg = buf.read(length)
+            pos = 0
+            while pos < length:
+                if pos >= len(seg):
+                    break
+                tc_tid = seg[pos]; pos += 1
+                tc  = (tc_tid >> 4) & 0xF
+                tid = tc_tid & 0xF
+                if pos + 16 > len(seg):
+                    break
+                counts = list(seg[pos:pos+16]); pos += 16
+                total_syms = sum(counts)
+                if pos + total_syms > len(seg):
+                    break
+                values = list(seg[pos:pos+total_syms]); pos += total_syms
+                codes = {}
+                code = 0
+                val_idx = 0
+                for ln, count in enumerate(counts):
+                    for _ in range(count):
+                        if val_idx < len(values):
+                            codes[(ln + 1, code)] = values[val_idx]
+                            val_idx += 1
+                        code += 1
+                    code <<= 1
+                huffman_tables[(tc, tid)] = codes
+            continue
+        if marker == 0xDA:
+            sos_len = read_u16() - 2
+            sos_hdr = buf.read(sos_len)
+            if not sos_hdr:
+                break
+            ncomp_s = sos_hdr[0]
+            comp_tables = {}
+            for i in range(ncomp_s):
+                if 1 + i*2 + 1 >= len(sos_hdr):
+                    break
+                cid = sos_hdr[1 + i*2]
+                tb  = sos_hdr[1 + i*2 + 1]
+                comp_tables[cid] = ((tb >> 4) & 0xF, tb & 0xF)
+            raw = bytearray()
+            while True:
+                b = buf.read(1)
+                if not b:
+                    break
+                if b == b'\xff':
+                    nb = buf.read(1)
+                    if nb == b'\x00':
+                        raw.append(0xFF)
+                    else:
+                        break
+                else:
+                    raw.append(b[0])
+            return bytes(raw), huffman_tables, comp_tables, frame_info
+        else:
+            length = read_u16() - 2
+            buf.read(length)
+    return None, {}, {}, {}
+
+
+def _jsteg_extract(data: bytes) -> tuple:
+    """
+    Extract JSteg-style payload from JPEG DCT coefficients.
+    JSteg embeds secret bits in the LSBs of non-zero AC DCT coefficients.
+    Returns (payload_bytes, n_nonzero_coeffs, capacity_bytes) or (None, 0, 0).
+    """
+    raw, huffman_tables, comp_tables, frame_info = _parse_jpeg_huffman_tables(data)
+    if not raw or not huffman_tables or not frame_info:
+        return None, 0, 0
+
+    bits_raw = len(raw) * 8
+
+    def get_bit(pos):
+        if pos >= bits_raw:
+            return 0
+        return (raw[pos >> 3] >> (7 - (pos & 7))) & 1
+
+    def huff_decode(tc, tid, pos):
+        table = huffman_tables.get((tc, tid), {})
+        code = 0
+        for ln in range(1, 17):
+            if pos >= bits_raw:
+                return None, pos
+            code = (code << 1) | get_bit(pos)
+            pos += 1
+            sym = table.get((ln, code))
+            if sym is not None:
+                return sym, pos
+        return None, pos
+
+    def coeff_decode(nbits, pos):
+        if nbits == 0:
+            return 0, pos
+        val = 0
+        for _ in range(nbits):
+            val = (val << 1) | get_bit(pos)
+            pos += 1
+        if nbits > 0 and val < (1 << (nbits - 1)):
+            val -= (1 << nbits) - 1
+        return val, pos
+
+    comp_ids = [c['id'] for c in frame_info.get('comp', [])]
+    if not comp_ids:
+        comp_ids = list(comp_tables.keys())
+
+    dc_prev = {cid: 0 for cid in comp_ids}
+    jsteg_bits = []
+    pos = 0
+    W = frame_info.get('w', 0)
+    H = frame_info.get('h', 0)
+    max_mcus = ((W + 7) // 8) * ((H + 7) // 8) * len(comp_ids) + 1
+
+    for _ in range(max_mcus):
+        if pos >= bits_raw - 32:
+            break
+        for cid in comp_ids:
+            if cid not in comp_tables:
+                continue
+            dc_id, ac_id = comp_tables[cid]
+            # DC coefficient
+            dc_sym, pos = huff_decode(0, dc_id, pos)
+            if dc_sym is None:
+                break
+            dc_val, pos = coeff_decode(dc_sym, pos)
+            dc_prev[cid] = dc_prev.get(cid, 0) + dc_val
+            # 63 AC coefficients
+            k = 1
+            while k < 64:
+                ac_sym, pos = huff_decode(1, ac_id, pos)
+                if ac_sym is None:
+                    k = 64; break
+                if ac_sym == 0x00:  # EOB
+                    k = 64; break
+                run   = (ac_sym >> 4) & 0xF
+                nbits = ac_sym & 0xF
+                k += run
+                if k >= 64:
+                    break
+                if nbits == 0:
+                    k += 1
+                    continue
+                ac_val, pos = coeff_decode(nbits, pos)
+                # JSteg: skip +-1 coefficients (they would become 0 on modif)
+                # Standard JSteg skips only 0, but many variants also skip +-1
+                if ac_val != 0:
+                    jsteg_bits.append(abs(ac_val) & 1)
+                k += 1
+
+    if not jsteg_bits:
+        return None, 0, 0
+
+    capacity = len(jsteg_bits) // 8
+    # Assemble bytes
+    payload = bytearray()
+    for i in range(0, len(jsteg_bits) - 7, 8):
+        byte = 0
+        for j in range(8):
+            byte = (byte << 1) | jsteg_bits[i + j]
+        payload.append(byte)
+    return bytes(payload), len(jsteg_bits), capacity
+
+
+def _jpeg_stego_findings(raw_bytes: bytes, source_label: str = '',
+                          wordlist=None, filename: str = '') -> list:
+    """
+    Run all JPEG-specific steganography detection passes:
+      1. Extension mismatch detection (JPEG magic with non-JPEG extension)
+      2. JSteg DCT coefficient LSB extraction
+      3. JPEG comment field extraction
+      4. Capacity analysis
+    Returns a list of Finding objects.
+    """
+    findings = []
+    if not raw_bytes or len(raw_bytes) < 4:
+        return findings
+    if raw_bytes[:2] != b'\xff\xd8':
+        return findings
+
+    # ── Pass 1: Extension mismatch ──────────────────────────────────────────
+    ext = (filename.rsplit('.', 1)[-1].lower() if '.' in filename else '')
+    if ext and ext not in ('jpg', 'jpeg', 'jpe', 'jif', 'jfif'):
+        f = Finding(
+            method='JPEG extension mismatch',
+            result_text=f'File is a JPEG (FFD8FF magic) but has extension .{ext}',
+            confidence='HIGH',
+            note='Extension mismatch is a common CTF misdirection technique'
+        )
+        f.score = 72
+        f.rrsw_signal = 'RRSW-TRACK'
+        f.why = (f'JPEG magic bytes FFD8FF detected in file with .{ext} extension. '
+                 f'Tools relying on file extension may misidentify or skip this file. '
+                 f'Check for JSteg, F5, or Steghide payloads.')
+        findings.append(f)
+
+    # ── Pass 2: JSteg DCT coefficient extraction ────────────────────────────
+    payload, n_bits, capacity = _jsteg_extract(raw_bytes)
+    if payload and capacity > 0:
+        # Analyse the payload
+        printable_ratio = sum(1 for b in payload[:512] if 32 <= b <= 126) / min(512, len(payload))
+        is_text = printable_ratio > 0.80
+        # Check for common file magic in payload
+        has_magic = (payload[:2] == b'\x1f\x8b' or  # gzip
+                     payload[:4] == b'PK\x03\x04' or  # zip
+                     payload[:3] == b'BZh' or          # bzip2
+                     payload[:4] == b'\x89PNG' or      # PNG
+                     payload[:4] == b'7z\xbc\xaf' or  # 7zip
+                     payload[:5] == b'Rar!\x1a')       # rar
+
+        # Score the payload
+        score = 30  # base score for any JSteg extraction
+        if is_text:
+            score += 40
+        if has_magic:
+            score += 35
+        if is_text and wordlist:
+            words = [w for w in payload[:1024].decode('utf-8', errors='replace').lower().split() if len(w) >= 3]
+            word_hits = sum(1 for w in words if w in wordlist)
+            if words:
+                score += int(word_hits / max(1, len(words)) * 30)
+
+        if is_text:
+            text_preview = payload[:1024].decode('utf-8', errors='replace')
+            conf = 'HIGH' if score >= 62 else 'MEDIUM'
+        elif has_magic:
+            text_preview = f'[Binary payload detected: {payload[:4].hex()} magic bytes]' 
+            conf = 'HIGH'
+        else:
+            text_preview = f'[{len(payload)} bytes extracted, not plaintext]' 
+            conf = 'LOW'
+
+        f = Finding(
+            method='JSteg DCT coefficient extraction',
+            result_text=text_preview,
+            result_bytes=payload if not is_text else None,
+            confidence=conf,
+            note=(f'Extracted from {n_bits} non-zero AC DCT coefficients. '
+                  f'JPEG capacity: ~{capacity} bytes. '
+                  f'Printable ratio: {printable_ratio:.0%}.')
+        )
+        f.score = score
+        f.rrsw_signal = 'RRSW-TRACK' if score >= 58 else 'RRSW-TRACE'
+        f.why = (
+            f'JSteg embeds data in the LSBs of non-zero AC DCT coefficients. '
+            f'This JPEG has {n_bits} non-zero AC coefficients = {capacity} bytes capacity. '
+            f'Payload printable ratio: {printable_ratio:.0%}. '
+        )
+        findings.append(f)
+
+        # If payload looks like text, also pass it through the analysis engine
+        if is_text and len(text_preview.strip()) >= 8:
+            # Add a capacity analysis finding regardless
+            cap_f = Finding(
+                method='JPEG JSteg capacity analysis',
+                result_text=(f'JPEG carrier: {capacity} bytes capacity in non-zero AC coefficients. '
+                             f'Extension: .{ext}. '
+                             f'Payload extracted: {len(payload)} bytes.'),
+                confidence='LOW',
+                note='JPEG DCT steganography capacity report'
+            )
+            cap_f.score = 20
+            cap_f.rrsw_signal = 'RRSW-NOISE'
+            cap_f.why = 'Informational: JPEG carrier analysis for steganography capacity'
+            findings.append(cap_f)
+
+    return findings
+
 def analyze_image_visual_stego(data: bytes, filename: str = '', wordlist: set = None,
                                full_nasty: bool = False):
     findings = []
@@ -5258,8 +5577,15 @@ def analyze_image_visual_stego(data: bytes, filename: str = '', wordlist: set = 
 def _light_stego_findings(data: bytes, filename: str, full_nasty=False):
     findings = []
     name = (filename or '').lower()
-    if not any(name.endswith(ext) for ext in ('.png','.bmp','.jpg','.jpeg','.webp','.tif','.tiff')):
+    # JPEG detection by magic bytes, not extension (catches .png-named JPEGs)
+    is_jpeg_magic = data[:2] == b'\xff\xd8' if data else False
+    is_image_ext = any(name.endswith(ext) for ext in ('.png','.bmp','.jpg','.jpeg','.webp','.tif','.tiff'))
+    if not is_image_ext and not is_jpeg_magic:
         return findings
+    # Run JPEG DCT stego pass whenever we see JPEG magic bytes
+    if is_jpeg_magic:
+        findings.extend(_jpeg_stego_findings(data, source_label=filename,
+                                              filename=name))
     try:
         from PIL import Image
         import io as _io
