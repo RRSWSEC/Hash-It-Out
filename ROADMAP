@@ -1,0 +1,106 @@
+HASHITOUT ROADMAP
+Vision
+
+Develop HASHITOUT from a broad decoding and artifact discovery tool into a reproducible, evidence-driven triage platform for real-world analysis.
+
+The goal is not to replace specialized tools, but to serve as a first-pass workbench for unknown or suspicious data.
+
+Phase 1 - Stabilization and Signal Quality
+Goals
+Reduce noise
+Improve trust in output
+Make behavior predictable
+Features
+Centralized deduplication engine
+Pass timing and failure visibility
+Removal of duplicated logic and constants
+Structured scoring model with multiple confidence factors
+Outcome
+
+Cleaner output, reduced noise, and more consistent results.
+
+Phase 2 - Evidence and Provenance
+Goals
+Make every finding traceable
+Enable reproducibility
+Features
+Provenance tracking including offsets, hashes, and source
+Artifact registry system
+Deterministic transform chains
+JSON and JSONL export
+Outcome
+
+Findings can be traced back to their origin and reproduced reliably.
+
+Phase 3 - Detection Intelligence
+Goals
+Improve usefulness outside of puzzles
+Reduce bias toward readable English output
+Features
+Structured content detection:
+JSON, XML, URLs, IPs, emails, JWTs, and similar formats
+Corroboration scoring across multiple passes
+Improved statistical and structural scoring
+Outcome
+
+The tool identifies meaningful structured data, not just readable text.
+
+Phase 4 - Artifact Depth
+Goals
+Move beyond surface-level inspection
+Features
+Expanded PNG analysis including CRC checks, chunk anomalies, and LSB extraction
+Expanded JPEG analysis including EXIF, segment parsing, and hidden data detection
+Recursive archive analysis
+Basic binary triage for formats such as PE, ELF, and PDF
+Outcome
+
+Improved detection of embedded, hidden, and layered content.
+
+Phase 5 - Analyst Workflow
+Goals
+Improve usability in real investigations
+Features
+Decode graph model representing artifacts and transformations
+Analyst notes and session persistence
+Triage profiles such as ctf, triage, forensics, low-noise, and deep
+Outcome
+
+The tool becomes a structured environment for analysis rather than a one-shot utility.
+
+Phase 6 - Field Capabilities
+Goals
+Support real-world investigative workflows
+Features
+IOC extraction including IPs, domains, emails, hashes, and related indicators
+Timeline generation from file and embedded metadata
+Batch and corpus analysis mode
+HTML report generation
+Outcome
+
+Usable for multi-file investigations and reporting.
+
+Phase 7 - Reliability and Trust
+Goals
+Ensure correctness and stability
+Features
+Regression test corpus
+Performance benchmarking
+Enforced explainability for high-confidence findings
+Outcome
+
+The tool becomes testable, stable, and trustworthy.
+
+Guiding Principles
+Deterministic over opaque
+Explainable over guesswork
+Signal over noise
+Evidence over assumption
+Designed for analyst use
+End State
+
+HASHITOUT becomes a deterministic, explainable, and reproducible triage engine for encoded, embedded, and structured data.
+
+Not just a decoder.
+
+A working tool for analysis.
