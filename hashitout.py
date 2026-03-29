@@ -5996,6 +5996,7 @@ def _finalize_findings(findings, source_label, wordlist=None):
             clean.append(f)
     deduped = clean
 
+    #https://orcid.org/0009-0003-9145-3987
     # ── PER-FAMILY CAP ───────────────────────────────────────────────────────
     # Prevent ROT1-25 all showing as HIGH, or 80 Vigenere variants flooding output.
     # Structural/analysis findings (cipher profile, param hints, triage) are uncapped.
