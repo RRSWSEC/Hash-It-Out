@@ -2181,21 +2181,212 @@ def analyze_image_deep(data: bytes, source_label: str = '') -> List[Finding]:
 
     return findings
 
-def _analyze_jpeg(data, source_label):
+def _analyze_jpeg(data: bytes, source_label: str) -> list:
+    """
+    JPEG triage: trailing data, comment segments, APPn segment map,
+    EXIF field extraction, thumbnail detection.
+    """
+    import struct
     findings = []
+
+    # ── Trailing data (after EOI 0xFFD9) ──────────────────────────────────
     eoi = data.rfind(b'\xff\xd9')
     if eoi != -1 and eoi + 2 < len(data):
         appended = data[eoi + 2:]
         printable = sum(1 for b in appended if 32 <= b <= 126 or b in (9, 10, 13))
-        if printable / len(appended) > 0.6:
+        if appended and printable / len(appended) > 0.5:
             findings.append(Finding(
                 method='JPEG appended data (after EOI)',
                 confidence='HIGH',
                 note=f'{len(appended)} bytes after JPEG end marker',
-                result_text=appended.decode('latin-1'),
+                result_text=appended.decode('latin-1', errors='replace'),
                 source_label=source_label,
             ))
+        elif appended:
+            findings.append(Finding(
+                method='JPEG appended binary (after EOI)',
+                confidence='MEDIUM',
+                result_bytes=appended,
+                note=f'{len(appended)} binary bytes after JPEG EOI marker',
+                source_label=source_label,
+            ))
+
+    # ── Segment map + APPn extraction ─────────────────────────────────────
+    pos = 2
+    seg_map = []
+    exif_data = b''
+    xmp_data  = b''
+    comments  = []
+    thumbnails = []
+
+    while pos + 3 < len(data):
+        if data[pos] != 0xFF:
+            pos += 1
+            continue
+        marker = data[pos + 1]
+        if marker in (0xD8, 0xD9, 0xDA):
+            break
+        if marker in (0xD0,0xD1,0xD2,0xD3,0xD4,0xD5,0xD6,0xD7):
+            pos += 2; continue
+        if pos + 4 > len(data):
+            break
+        try:
+            length = struct.unpack('>H', data[pos+2:pos+4])[0]
+        except Exception:
+            break
+        seg_end  = pos + 2 + length
+        seg_data = data[pos+4:seg_end]
+        marker_name = 'FF%02X' % marker
+        seg_map.append((pos, marker_name, length, seg_data[:16].hex()))
+
+        # Comment FFFE
+        if marker == 0xFE:
+            try:
+                c = seg_data.decode('utf-8', errors='replace').strip()
+                if c:
+                    comments.append(c)
+            except Exception:
+                pass
+
+        # APP0 JFIF thumbnail
+        if marker == 0xE0 and seg_data[:4] == b'JFIF':
+            if len(seg_data) > 10:
+                tw = seg_data[8] if len(seg_data) > 8 else 0
+                th = seg_data[9] if len(seg_data) > 9 else 0
+                if tw and th:
+                    thumbnails.append(('JFIF', tw, th, seg_data[10:]))
+
+        # APP1 EXIF
+        if marker == 0xE1 and seg_data[:4] == b'Exif':
+            exif_data = seg_data[6:]
+
+        # APP1 XMP
+        if marker == 0xE1 and b'xap/1.0/' in seg_data[:40]:
+            xmp_data = seg_data
+
+        pos = seg_end
+
+    # Segment map
+    if seg_map:
+        seg_summary = '  '.join('%s@0x%x' % (m, o) for o, m, _, _ in seg_map[:20])
+        findings.append(Finding(
+            method='JPEG segment map',
+            result_text=seg_summary,
+            confidence='LOW',
+            note='%d segments found' % len(seg_map),
+            source_label=source_label,
+        ))
+
+    # Comments
+    for comment in comments:
+        findings.append(Finding(
+            method='JPEG comment segment (FFFE)',
+            result_text=comment,
+            confidence='HIGH' if len(comment) > 10 else 'MEDIUM',
+            note='Embedded comment: %d chars' % len(comment),
+            source_label=source_label,
+        ))
+
+    # EXIF
+    if exif_data:
+        exif_fields = _parse_exif_basic(exif_data)
+        if exif_fields:
+            field_text = '\n'.join('%s: %s' % (k, v) for k, v in exif_fields.items())
+            findings.append(Finding(
+                method='EXIF metadata',
+                result_text=field_text,
+                confidence='MEDIUM',
+                note='%d EXIF fields extracted' % len(exif_fields),
+                source_label=source_label,
+            ))
+
+    # XMP
+    if xmp_data:
+        try:
+            xmp_text = xmp_data.decode('utf-8', errors='replace').strip()
+            if xmp_text:
+                findings.append(Finding(
+                    method='XMP metadata',
+                    result_text=xmp_text[:1000],
+                    confidence='MEDIUM',
+                    note='%d bytes XMP/RDF metadata' % len(xmp_data),
+                    source_label=source_label,
+                ))
+        except Exception:
+            pass
+
+    # Thumbnails
+    for label, w, h, tb in thumbnails:
+        if len(tb) > 100:
+            findings.append(Finding(
+                method='JPEG embedded thumbnail (%s)' % label,
+                result_bytes=tb,
+                confidence='MEDIUM',
+                note='%dx%d px thumbnail, %d bytes' % (w, h, len(tb)),
+                source_label=source_label,
+            ))
+
     return findings
+
+
+def _parse_exif_basic(data: bytes) -> dict:
+    """Pure-Python minimal EXIF IFD parser. No external dependencies."""
+    import struct
+    if not data or len(data) < 8:
+        return {}
+    if data[:2] == b'II':
+        bo = '<'
+    elif data[:2] == b'MM':
+        bo = '>'
+    else:
+        return {}
+    try:
+        ifd_offset = struct.unpack_from(bo + 'I', data, 4)[0]
+        if ifd_offset + 2 > len(data):
+            return {}
+        count = struct.unpack_from(bo + 'H', data, ifd_offset)[0]
+    except Exception:
+        return {}
+
+    TAGS = {
+        0x010F:'Make', 0x0110:'Model', 0x0131:'Software',
+        0x0132:'DateTime', 0x013B:'Artist', 0x8298:'Copyright',
+        0x9003:'DateTimeOriginal', 0x9004:'DateTimeDigitized',
+        0xA420:'ImageUniqueID', 0x9C9B:'XPTitle', 0x9C9C:'XPComment',
+        0x9C9D:'XPAuthor', 0x9C9E:'XPKeywords', 0x9C9F:'XPSubject',
+        0xA002:'PixelXDimension', 0xA003:'PixelYDimension',
+        0x0100:'ImageWidth', 0x0101:'ImageLength',
+        0x0112:'Orientation', 0x0128:'ResolutionUnit',
+    }
+    fields = {}
+    entry_start = ifd_offset + 2
+    for i in range(min(count, 60)):
+        offset = entry_start + i * 12
+        if offset + 12 > len(data):
+            break
+        try:
+            tag, dtype, ncomp = struct.unpack_from(bo + 'HHI', data, offset)
+            name = TAGS.get(tag)
+            if not name:
+                continue
+            voff = offset + 8
+            if dtype == 2:  # ASCII
+                if ncomp > 4:
+                    raw_off = struct.unpack_from(bo + 'I', data, voff)[0]
+                    str_bytes = data[raw_off:raw_off + ncomp]
+                else:
+                    str_bytes = data[voff:voff + ncomp]
+                val = str_bytes.rstrip(b'\x00').decode('utf-8', errors='replace').strip()
+                if val:
+                    fields[name] = val
+            elif dtype in (3, 4):  # SHORT / LONG
+                fmt = 'H' if dtype == 3 else 'I'
+                val = struct.unpack_from(bo + fmt, data, voff)[0]
+                fields[name] = str(val)
+        except Exception:
+            continue
+    return fields
+
 
 def _analyze_png(data, source_label):
     findings = []
@@ -2401,7 +2592,7 @@ BANNER = r"""
 def print_banner(version=None):
     print(f"{C.TOXGRN}{C.BOLD}{BANNER}{C.RESET}")
     print(f"{C.TOXGRN}  decoder  |  reverser  |  file carver  |  stego scanner  |  crypto detector{C.RESET}")
-    print(f"{C.GREY}  v{version or VERSION}  |  github.com/RRSWSEC/Hash-It-Out  |  RRSW Corp{C.RESET}")
+    print(f"{C.GREY}  github.com/RRSWSEC/Hash-It-Out  |  RRSW Corp{C.RESET}")
     print(f"{C.GREY}  {'+'+'='*54+'+'}{C.RESET}")
     print(f"{C.GREY}  |  for educational and authorized research use only   |{C.RESET}")
     print(f"{C.GREY}  {'+'+'='*54+'+'}{C.RESET}")
@@ -2428,7 +2619,7 @@ def print_input_header(source, size, filetype=None, entropy=None,
         elif entropy > 6.0: ecol = C.YELLOW
         else:               ecol = C.GREY
         meta.append(f"{ecol}entropy {entropy:.2f}{C.RESET}")
-    if depth is not None:
+    if False:  # depth removed from display
         meta.append(f"{C.GREY}depth {depth}{C.RESET}")
     if wordlist_size:
         meta.append(f"{C.GREY}{wordlist_size:,} words{C.RESET}")
@@ -2469,24 +2660,293 @@ def _method_label(method, maxlen=50):
         m = m[:maxlen-2] + '..'
     return m
 
+
+# ── Pass timing registry ──────────────────────────────────────────────────
+_PASS_TIMING: List[Dict] = []
+
+def _pass_record(name: str, status: str = 'ok', duration: float = 0.0,
+                 candidates: int = 0, error: str = '') -> None:
+    _PASS_TIMING.append({
+        'pass': name, 'status': status,
+        'duration_ms': round(duration * 1000, 1),
+        'candidates': candidates, 'error': error,
+    })
+
+def _print_pass_timing() -> None:
+    if not _PASS_TIMING:
+        return
+    print(f"\n  {C.GREY}pass timing:{C.RESET}")
+    total_ms = sum(p['duration_ms'] for p in _PASS_TIMING)
+    for p in sorted(_PASS_TIMING, key=lambda x: -x['duration_ms'])[:20]:
+        bar_len = max(1, int(p['duration_ms'] / max(total_ms, 1) * 30))
+        bar = '█' * bar_len
+        status_col = C.GREEN if p['status'] == 'ok' else (C.YELLOW if p['status'] == 'skip' else C.RED)
+        print(f"  {status_col}{p['status']:4}{C.RESET}  {p['pass']:<36}  "
+              f"{C.GREY}{p['duration_ms']:6.0f}ms  {bar}  {p['candidates']} candidates{C.RESET}")
+        if p['error']:
+            print(f"         {C.RED}error: {p['error'][:80]}{C.RESET}")
+    print(f"  {C.GREY}total: {total_ms:.0f}ms across {len(_PASS_TIMING)} passes{C.RESET}\n")
+
+
+
+# ── Evidence-grade confidence labels for analyst mode ─────────────────────
+_ANALYST_CONF = {
+    'CONFIRMED': 'CONFIRMED',
+    'HIGH':      'PROBABLE',
+    'MEDIUM':    'POSSIBLE',
+    'LOW':       'INSUFFICIENT',
+}
+_ANALYST_CONF_COLOR = {
+    'CONFIRMED':    C.TOXGRN,
+    'PROBABLE':     C.HIGH,
+    'POSSIBLE':     C.MEDIUM,
+    'INSUFFICIENT': C.LOW,
+}
+
+
+def _analyst_ioc_summary(findings) -> str:
+    """Aggregate IOCs across all findings, dedupe, group by type."""
+    from collections import defaultdict
+    groups = defaultdict(set)
+    for f in findings:
+        for ioc in (getattr(f, 'iocs', []) or []):
+            t = ioc.get('type', 'unknown')
+            v = ioc.get('value', '')
+            if v:
+                groups[t].add(v)
+    if not groups:
+        return ''
+    out = []
+    TYPE_ORDER = ('url','ipv4','ipv6','domain','email','jwt','pem_block',
+                  'sha256','sha1','md5','command')
+    for t in TYPE_ORDER:
+        if t in groups:
+            vals = sorted(groups[t])[:6]
+            out.append(f"  {C.CYAN}{t:<14}{C.RESET} {('  ').join(vals[:3])}")
+            if len(vals) > 3:
+                out.append(f"  {'':14} {('  ').join(vals[3:6])}")
+    for t in sorted(groups):
+        if t not in TYPE_ORDER:
+            out.append(f"  {C.CYAN}{t:<14}{C.RESET} {', '.join(sorted(groups[t])[:4])}")
+    return '\n'.join(out)
+
+
+def _analyst_timeline(findings) -> str:
+    """Pull timestamps from findings and return a sorted timeline."""
+    import re as _re
+    entries = []
+    seen = set()
+    PATS = [
+        _re.compile(r'\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})'),
+        _re.compile(r'\b(\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2})'),
+        _re.compile(r'\b(\d{4}-\d{2}-\d{2})\b'),
+    ]
+    for f in findings:
+        txt = f.result_text or ''
+        if not txt:
+            continue
+        method = f.method or ''
+        for pat in PATS:
+            for m in pat.finditer(txt):
+                raw = m.group(1)
+                norm = raw.replace(':','-',2) if re.match(r'\d{4}:\d{2}:\d{2}', raw) else raw
+                key = (norm, method[:40])
+                if key not in seen:
+                    seen.add(key)
+                    entries.append((norm, method[:50]))
+    if not entries:
+        return ''
+    entries.sort(key=lambda x: x[0])
+    prev_date, out = '', []
+    for ts, src_method in entries[:20]:
+        date = ts[:10]
+        if date != prev_date:
+            out.append(f"  {C.GREY}{date}{C.RESET}")
+            prev_date = date
+        out.append(f"    {ts}  {C.GREY}{src_method}{C.RESET}")
+    return '\n'.join(out)
+
+
+def print_results_analyst(findings, source_label, input_size, saved_files=None):
+    """
+    Analyst-mode output — IOC-first, evidence-grade, defensible.
+
+    Read order (top → cursor):
+      ══ case header (farthest from cursor)
+      ── IOC summary
+      ── timeline (if present)
+      ── suppressed count
+      ── other signal hits with analyst narrative
+      ── BEST MATCH box right at cursor
+    """
+    if not findings:
+        print(f"  {C.GREY}no findings{C.RESET}")
+        return
+
+    import datetime as _dt
+
+    conf_rank = {'CONFIRMED': 3, 'HIGH': 2, 'MEDIUM': 1, 'LOW': 0}
+    sorted_f = sorted(findings,
+                      key=lambda f: (conf_rank.get(f.confidence, 0), f.score),
+                      reverse=True)
+
+    # Deduplicate by content
+    def _norm(t):
+        return re.sub(r'[^a-z0-9]', '', (t or '').lower())[:300]
+
+    seen_norm, aliases = {}, {}
+    for f in sorted_f:
+        norm = _norm(f.result_text or '')
+        if not norm or len(norm) < 6:
+            seen_norm[(f.method or '') + str(id(f))] = f
+            continue
+        if norm not in seen_norm:
+            seen_norm[norm] = f
+            aliases[id(f)] = []
+        else:
+            aliases.setdefault(id(seen_norm[norm]), []).append(f.method or '')
+
+    deduped = sorted(seen_norm.values(),
+                     key=lambda f: (conf_rank.get(f.confidence, 0), f.score),
+                     reverse=True)
+
+    # Signal = CONFIRMED or HIGH only
+    signal = [f for f in deduped if f.confidence in ('CONFIRMED', 'HIGH')]
+    suppressed = [f for f in deduped if f.confidence not in ('CONFIRMED', 'HIGH')]
+    _W2 = _W
+
+    # ── Case header ──────────────────────────────────────────────────────────
+    ts_now = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+    counts = {c: sum(1 for f in deduped if f.confidence == c)
+              for c in ('CONFIRMED','HIGH','MEDIUM','LOW')}
+    count_parts = []
+    for c in ('CONFIRMED','HIGH','MEDIUM','LOW'):
+        if counts.get(c):
+            aconf = _ANALYST_CONF.get(c, c)
+            col   = _ANALYST_CONF_COLOR.get(aconf, C.GREY)
+            count_parts.append(f"{col}{counts[c]} {aconf}{C.RESET}")
+
+    print()
+    print(f"  {C.GREY}{'═'*_W2}{C.RESET}")
+    print(f"  {C.WHITE}ANALYST REPORT  ·  {source_label}  ·  {ts_now}{C.RESET}")
+    print(f"  {'  '.join(count_parts)}")
+    print(f"  {C.GREY}{'─'*_W2}{C.RESET}")
+    print()
+
+    # ── IOC summary ──────────────────────────────────────────────────────────
+    ioc_txt = _analyst_ioc_summary(deduped)
+    if ioc_txt:
+        print(f"  {C.CYAN}EXTRACTED INDICATORS{C.RESET}")
+        print(ioc_txt)
+        print()
+
+    # ── Timeline ─────────────────────────────────────────────────────────────
+    tl_txt = _analyst_timeline(deduped)
+    if tl_txt:
+        print(f"  {C.CYAN}TIMELINE{C.RESET}")
+        print(tl_txt)
+        print()
+
+    # ── Suppressed count ─────────────────────────────────────────────────────
+    if suppressed:
+        print(f"  {C.GREY}  {len(suppressed)} POSSIBLE/INSUFFICIENT findings not shown"
+              f"  (--verbose to show all){C.RESET}")
+        print()
+
+    # ── Other signal hits with narrative ─────────────────────────────────────
+    rest = signal[1:] if signal else []
+    if rest:
+        print(f"  {C.GREY}other signal hits  {'─'*max(1,_W2-20)}{C.RESET}")
+        for f in rest[:8]:
+            aconf  = _ANALYST_CONF.get(f.confidence, f.confidence)
+            col    = _ANALYST_CONF_COLOR.get(aconf, C.GREY)
+            label  = (f.method or '')[:44]
+            out    = (f.result_text or '')[:160].replace('\n',' ')
+            sc     = int(f.score)
+            stype  = getattr(f, 'structured_type', '') or ''
+            iocs   = getattr(f, 'iocs', []) or []
+            badge  = ''
+            if stype:
+                badge += f" {C.CYAN}{stype}{C.RESET}"
+            if iocs:
+                kinds = list({i['type'] for i in iocs})[:3]
+                badge += f" {C.GREY}IOC:{','.join(kinds)}{C.RESET}"
+            print(f"  {col}[{aconf[:4]}]{C.RESET}"
+                  f" {C.WHITE}{label:<44}{C.RESET}"
+                  f" {C.GREY}[{sc}]{C.RESET}{badge}")
+            print(f"       {C.GREY}{out[:160]}{C.RESET}")
+            # Analyst narrative
+            bundle = _analyst_bundle(f)
+            if bundle.get('interpretation'):
+                print(f"       {C.GREY}consistent with: {bundle['interpretation'][:120]}{C.RESET}")
+            if bundle.get('next_steps'):
+                print(f"       {C.GREY}suggest:         {bundle['next_steps'][:120]}{C.RESET}")
+        print()
+
+    # ── BEST MATCH — right at cursor ─────────────────────────────────────────
+    best = signal[0] if signal else (deduped[0] if deduped else None)
+    if best:
+        aconf      = _ANALYST_CONF.get(best.confidence, best.confidence)
+        col        = _ANALYST_CONF_COLOR.get(aconf, C.GREY)
+        method_str = (best.method or '')[:60]
+        score_str  = str(int(best.score))
+        bundle     = _analyst_bundle(best)
+        stype      = getattr(best, 'structured_type', '') or ''
+        iocs       = getattr(best, 'iocs', []) or []
+        chain_str  = ' → '.join(getattr(best, 'chain', []) or [best.method or ''])
+        fid        = getattr(best, 'finding_id', '') or ''
+        sup        = getattr(best, 'support_count', 1)
+
+        print()
+        print(f"  {col}{C.BOLD}{'━'*_W2}{C.RESET}")
+        print(f"  {col}{C.BOLD}  {aconf}  ·  {method_str}  ·  score {score_str}{C.RESET}")
+        if fid:
+            print(f"  {C.GREY}  finding #{fid}  ·  {chain_str[:60]}{C.RESET}")
+        print(f"  {col}{C.BOLD}{'━'*_W2}{C.RESET}")
+        # Result content
+        preview = (best.result_text or '')[:600].replace('\n', ' ')
+        print(f"  {C.WHITE}{preview}{C.RESET}")
+        print()
+        # Structured type + IOCs
+        if stype or iocs:
+            stype_str = f"{C.CYAN}type: {stype}  {C.RESET}" if stype else ''
+            if iocs:
+                kinds    = list({i['type'] for i in iocs})[:5]
+                ioc_vals = [i['value'] for i in iocs[:4]]
+                ioc_str  = (f"{C.GREY}indicators [{','.join(kinds)}]: "
+                            f"{', '.join(ioc_vals)}"
+                            f"{'…' if len(iocs)>4 else ''}{C.RESET}")
+            else:
+                ioc_str = ''
+            print(f"  {stype_str}{ioc_str}")
+        if sup > 1:
+            print(f"  {C.TOXGRN}  corroborated by {sup} independent passes{C.RESET}")
+        # Analyst narrative — conservative language
+        if bundle.get('interpretation'):
+            print(f"  {C.GREY}  consistent with: {bundle['interpretation'][:180]}{C.RESET}")
+        if bundle.get('hypothesis'):
+            print(f"  {C.GREY}  suggests:        {bundle['hypothesis'][:180]}{C.RESET}")
+        if bundle.get('next_steps'):
+            print(f"  {C.GREY}  worth verifying: {bundle['next_steps'][:180]}{C.RESET}")
+        print(f"  {col}{C.BOLD}{'━'*_W2}{C.RESET}")
+        print()
+
+
 def print_results(findings, source_label, input_size, saved_files=None, verbose=True, nocolor=False):
     if not findings:
         print(f"{C.GREY}  no findings{C.RESET}")
         return
 
-    # ── Collapse identical content ──────────────────────────────────────────
-    # Multiple methods producing the same plaintext → one entry + alias list.
     def _norm(txt):
         return re.sub(r'[^a-z0-9]', '', (txt or '').lower())[:300]
-
-    seen_norm = {}   # norm → best Finding
-    aliases   = {}   # id(finding) → [alias method strings]
 
     conf_rank = {'CONFIRMED': 3, 'HIGH': 2, 'MEDIUM': 1, 'LOW': 0}
     sorted_in = sorted(findings,
                        key=lambda f: (conf_rank.get(f.confidence, 0), f.score),
                        reverse=True)
 
+    seen_norm = {}
+    aliases   = {}
     for f in sorted_in:
         txt  = f.result_text or ''
         norm = _norm(txt)
@@ -2503,107 +2963,133 @@ def print_results(findings, source_label, input_size, saved_files=None, verbose=
     deduped = list(seen_norm.values())
     deduped.sort(key=lambda f: (conf_rank.get(f.confidence, 0), f.score), reverse=True)
 
-    confirmed = [f for f in deduped if f.confidence == 'CONFIRMED']
-    high      = [f for f in deduped if f.confidence == 'HIGH']
-    medium    = [f for f in deduped if f.confidence == 'MEDIUM']
-    low       = [f for f in deduped if f.confidence == 'LOW']
-
     saved = saved_files or []
 
-    def _print_finding(f):
-        icon  = _CONF_ICON.get(f.confidence, '  [?]')
-        color = _CONF_COLOR.get(f.confidence, C.WHITE)
-        label = _method_label(f.method)
-        out   = _format_output(f.result_text or f.note or '', maxlen=500)
+    _STRUCTURAL_KEYWORDS = (
+        'Parameter Hints', 'Cipher Profile', 'Substitution Helper',
+        'Embedded ASCII', 'Artifact Triage', 'Artifact Tree',
+        'Key Hints', 'Cipher family', 'JPEG JSteg capacity',
+    )
+    def _is_structural(f):
+        m = f.method or ''
+        return any(kw.lower() in m.lower() for kw in _STRUCTURAL_KEYWORDS)
 
-        method_col = f"{color}{label:<50}{C.RESET}"
-        if out:
-            print(f"{icon} {method_col}  {C.WHITE}{out}{C.RESET}")
-        else:
-            print(f"{icon} {method_col}")
+    signal_findings     = [f for f in deduped if not _is_structural(f)]
+    structural_findings = [f for f in deduped if _is_structural(f)]
 
-        extras = []
-        if f.note and f.note != out and len(f.note) < 120:
-            note_clean = _format_output(f.note, 80)
-            if note_clean and note_clean != out:
-                extras.append(note_clean)
+    TOP_N = None if verbose else 5
+    if TOP_N is None:
+        top5       = signal_findings
+        suppressed = structural_findings
+    else:
+        top5       = signal_findings[:TOP_N]
+        suppressed = signal_findings[TOP_N:] + structural_findings
 
-        alias_list = aliases.get(id(f), [])
-        if alias_list:
-            short = [_method_label(a) for a in alias_list[:4]]
-            extras.append('also: ' + ', '.join(short) + (f' +{len(alias_list)-4}' if len(alias_list)>4 else ''))
+    best = top5[0] if top5 else (deduped[0] if deduped else None)
+    rest = top5[1:] if best else top5
 
-        if extras:
-            print(f"       {C.GREY}{('  |  ').join(extras)}{C.RESET}")
+    # ── Totals line first (top of results, farthest from cursor) ────────────
+    total     = len(deduped)
+    extracted = len([sv for sv in saved if sv])
+    confirmed = len([f for f in deduped if f.confidence == 'CONFIRMED'])
+    high_c    = len([f for f in deduped if f.confidence == 'HIGH'])
+    medium_c  = len([f for f in deduped if f.confidence == 'MEDIUM'])
+    low_c     = len([f for f in deduped if f.confidence == 'LOW'])
 
-    # ── BEST MATCH BOX — always first, user never scrolls ──────────────────
-    best = deduped[0] if deduped else None
-    if best and best.result_text:
-        score_str = f"score {best.score}" if best.score else ''
-        conf_str  = best.confidence
-        method_str = _method_label(best.method)
-        alias_list = aliases.get(id(best), [])
-        also = ''
-        if alias_list:
-            short = [_method_label(a) for a in alias_list[:3]]
-            also = '  also: ' + ', '.join(short) + (f' +{len(alias_list)-3} more' if len(alias_list)>3 else '')
-
-        _W2 = _W
-        print()
-        print(f"  {C.TOXGRN}{C.BOLD}" + chr(9473)*_W2 + f"{C.RESET}")
-        print(f"  {C.TOXGRN}{C.BOLD}  ★  BEST MATCH  ·  {method_str}  ·  {conf_str}  ·  {score_str}{C.RESET}")
-        print(f"  {C.TOXGRN}{C.BOLD}" + chr(9473)*_W2 + f"{C.RESET}")
-        preview = (best.result_text or '')[:400].replace('\n', ' ')
-        print(f"  {C.WHITE}{preview}{C.RESET}")
-        if also:
-            print(f"  {C.GREY}{also.strip()}{C.RESET}")
-        print(f"  {C.TOXGRN}{C.BOLD}" + chr(9473)*_W2 + f"{C.RESET}")
-        print()
-
-    # ── Tier list below ────────────────────────────────────────────────────
-    if confirmed:
-        _W2 = _W
-        print("  \033[38;5;82m\033[1m" + chr(9473)*_W2 + "\033[0m")
-        print("  \033[38;5;82m\033[1m  [\u2713] CONFIRMED PLAINTEXT  \u2014  natural English detected\033[0m")
-        print("  \033[38;5;82m\033[1m" + chr(9473)*_W2 + "\033[0m")
-        for _f in confirmed:
-            _print_finding(_f)
-        print()
-
-    if high:
-        print(f"  {C.HIGH}{C.BOLD}HIGH CONFIDENCE{C.RESET}  {C.HIGH}{_line('-')}{C.RESET}")
-        for f in high:
-            _print_finding(f)
-        print()
-
-    if medium:
-        print(f"  {C.MEDIUM}{C.BOLD}MEDIUM CONFIDENCE{C.RESET}  {C.MEDIUM}{_line('-')}{C.RESET}")
-        for f in medium:
-            _print_finding(f)
-        print()
-
-    if low:
-        print(f"  {C.LOW}LOW CONFIDENCE{C.RESET}  {C.LOW}{_line('-')}{C.RESET}")
-        for f in low:
-            _print_finding(f)
-        print()
-
-    co = len(confirmed)
-    h  = len(high)
-    m  = len(medium)
-    l  = len(low)
-    e  = len([s for s in saved if s])
-
-    parts = []
-    if co: parts.append("\033[38;5;82m\033[1m%d CONFIRMED\033[0m" % co)
-    if h:  parts.append(f"{C.HIGH}{h} HIGH{C.RESET}")
-    if m:  parts.append(f"{C.MEDIUM}{m} MEDIUM{C.RESET}")
-    if l:  parts.append(f"{C.LOW}{l} LOW{C.RESET}")
-    if e:  parts.append(f"{C.GREEN}{e} file{'s' if e!=1 else ''} extracted{C.RESET}")
+    tparts = []
+    if confirmed: tparts.append("\033[38;5;82m\033[1m%d CONFIRMED\033[0m" % confirmed)
+    if high_c:    tparts.append(f"{C.HIGH}{high_c} HIGH{C.RESET}")
+    if medium_c:  tparts.append(f"{C.MEDIUM}{medium_c} MEDIUM{C.RESET}")
+    if low_c:     tparts.append(f"{C.LOW}{low_c} LOW{C.RESET}")
+    if extracted: tparts.append(f"{C.GREEN}{extracted} file{'s' if extracted!=1 else ''} extracted{C.RESET}")
 
     print(f"  {C.GREY}{_line('=')}{C.RESET}")
-    print(f"  {('  |  ').join(parts)}")
+    print(f"  {('  |  ').join(tparts)}")
     print()
+
+    # ── Suppressed count (above runners-up) ──────────────────────────────────
+    n_sup = len(suppressed)
+    if n_sup:
+        conf_breakdown = {}
+        for f in suppressed:
+            c = f.confidence
+            conf_breakdown[c] = conf_breakdown.get(c, 0) + 1
+        parts_sup = []
+        for c in ('CONFIRMED', 'HIGH', 'MEDIUM', 'LOW'):
+            if conf_breakdown.get(c):
+                col = _CONF_COLOR.get(c, C.GREY)
+                parts_sup.append(f"{col}{conf_breakdown[c]} {c}{C.RESET}")
+        breakdown = '  |  '.join(parts_sup)
+        print(f"  {C.GREY}  {n_sup} additional findings not shown  ({breakdown}{C.GREY}){C.RESET}")
+        print(f"  {C.GREY}  --verbose for full list  |  --report saves everything{C.RESET}")
+        print()
+
+    # ── Runners-up (above best match) ────────────────────────────────────────
+    if rest:
+        print(f"  {C.GREY}other hits  {_line('·', C.GREY)}{C.RESET}")
+        for f in rest:
+            icon       = _CONF_ICON.get(f.confidence, '  [?]')
+            color      = _CONF_COLOR.get(f.confidence, C.WHITE)
+            label      = _method_label(f.method)
+            out        = _format_output(f.result_text or f.note or '', maxlen=180)
+            alias_list = aliases.get(id(f), [])
+            alias_str  = ''
+            if alias_list:
+                short     = [_method_label(a) for a in alias_list[:2]]
+                alias_str = (f"  {C.GREY}also: " + ", ".join(short) + ("\u2026" if len(alias_list)>2 else "") + f"{C.RESET}")
+            sc = f'{C.GREY}[{f.score}]{C.RESET}' if f.score else ''
+            print(f"  {icon} {color}{label:<44}{C.RESET} {sc}  {C.WHITE}{out}{C.RESET}{alias_str}")
+            # Structured type + IOC summary inline
+            stype = getattr(f, 'structured_type', '') or ''
+            iocs  = getattr(f, 'iocs', []) or []
+            sup   = getattr(f, 'support_count', 1)
+            extras2 = []
+            if stype:
+                extras2.append(f'{C.CYAN}{stype}{C.RESET}')
+            if iocs:
+                kinds = list({i['type'] for i in iocs})[:3]
+                extras2.append(f"{C.GREY}IOC: {', '.join(kinds)} ({len(iocs)}){C.RESET}")
+            if sup > 1:
+                extras2.append(f'{C.TOXGRN}corroborated x{sup}{C.RESET}')
+            if extras2:
+                print(f"         {'  '.join(extras2)}")
+        print()
+
+    # ── BEST MATCH — printed last, right at cursor ────────────────────────────
+    if best and best.result_text:
+        alias_list = aliases.get(id(best), [])
+        also       = ''
+        if alias_list:
+            short = [_method_label(a) for a in alias_list[:3]]
+            also  = '  also: ' + ', '.join(short) + (f' +{len(alias_list)-3} more' if len(alias_list)>3 else '')
+        method_str = _method_label(best.method)
+        score_str  = f'score {best.score}' if best.score else ''
+        print()
+        print(f"  {C.TOXGRN}{C.BOLD}" + chr(9473)*_W + f"{C.RESET}")
+        print(f"  {C.TOXGRN}{C.BOLD}  {method_str}  ·  {best.confidence}  ·  {score_str}{C.RESET}")
+        print(f"  {C.TOXGRN}{C.BOLD}" + chr(9473)*_W + f"{C.RESET}")
+        preview = (best.result_text or '')[:600].replace('\n', ' ')
+        print(f"  {C.WHITE}{preview}{C.RESET}")
+        # Structured type + IOC summary in best match box
+        _bstype = getattr(best, 'structured_type', '') or ''
+        _biocs  = getattr(best, 'iocs', []) or []
+        _bsup   = getattr(best, 'support_count', 1)
+        _bextras = []
+        if _bstype:
+            _bextras.append(f'{C.CYAN}type: {_bstype}{C.RESET}')
+        if _biocs:
+            _kinds = list({i['type'] for i in _biocs})[:4]
+            _bextras.append(f"{C.GREY}IOC: {', '.join(_kinds)} ({len(_biocs)} found){C.RESET}")
+        if _bsup > 1:
+            _bextras.append(f'{C.TOXGRN}corroborated by {_bsup} passes{C.RESET}')
+        if also:
+            print(f"  {C.GREY}{also.strip()}{C.RESET}")
+        if _bextras:
+            print(f"  {'  '.join(_bextras)}")
+        print(f"  {C.TOXGRN}{C.BOLD}" + chr(9473)*_W + f"{C.RESET}")
+        print()
+
+
 
 
 class FetchResult:
@@ -4884,52 +5370,156 @@ def _artifact_tree_summary(findings):
     return Finding(method=_ARTIFACT_TREE_METHOD, result_text='\n'.join(children[:30]), confidence='LOW', note='summary of binary child artifacts currently in result set')
 
 def _zip_member_findings(data: bytes, engine=None, source_label='ZIP'):
+    """
+    Deep ZIP triage: member listing, per-entry metadata, timestamps,
+    encrypted member detection, archive comment, nested archive flagging.
+    """
     findings = []
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            for info in zf.infolist():
+            # Archive-level comment
+            comment = zf.comment
+            if comment:
+                try:
+                    c_text = comment.decode('utf-8', errors='replace').strip()
+                    if c_text:
+                        findings.append(Finding(
+                            method='ZIP archive comment',
+                            result_text=c_text,
+                            confidence='HIGH',
+                            note='Embedded archive comment: %d bytes' % len(comment),
+                            source_label=source_label,
+                        ))
+                except Exception:
+                    pass
+
+            import hashlib as _hl
+            import datetime as _dt
+
+            infos             = zf.infolist()
+            encrypted_members = []
+            nested_archives   = []
+            member_lines      = []
+
+            for info in infos:
                 if info.is_dir():
+                    member_lines.append('[DIR]  %s' % info.filename)
                     continue
+
+                is_enc = bool(info.flag_bits & 0x1)
+                if is_enc:
+                    encrypted_members.append(info.filename)
+
+                try:
+                    ts_tuple = info.date_time
+                    ts = _dt.datetime(*ts_tuple).isoformat() if ts_tuple[0] > 1980 else ''
+                except Exception:
+                    ts = ''
+
+                lower_fn = info.filename.lower()
+                is_nested = any(lower_fn.endswith(x) for x in (
+                    '.zip','.jar','.war','.ear','.docx','.xlsx','.pptx','.gz','.7z'))
+                if is_nested:
+                    nested_archives.append(info.filename)
+
+                enc_label = '[ENC] ' if is_enc else ''
+                nested_label = '  [nested]' if is_nested else ''
+                member_lines.append('%s%s  %s  size=%d%s' % (
+                    enc_label, info.filename, ts, info.file_size, nested_label))
+
+                if is_enc:
+                    continue
+
                 try:
                     payload = zf.read(info.filename)
                 except Exception:
                     continue
-                ft = detect_filetype(payload)
-                note = f'ZIP member {info.filename} ({len(payload):,} bytes)'
+
+                ft     = detect_filetype(payload)
+                sha256 = _hl.sha256(payload).hexdigest()
+                note   = 'ZIP member %s (%d bytes, sha256=%s...)' % (
+                    info.filename, len(payload), sha256[:16])
+
                 member = Finding(
-                    method=f'ZIP Member: {info.filename}',
+                    method='ZIP member: %s' % info.filename,
                     result_bytes=payload,
                     filetype=ft,
                     confidence='HIGH' if ft else 'MEDIUM',
                     note=note,
+                    source_label=source_label,
                 )
                 member.child_count = 0
+                member.input_sha256 = sha256
+                if ts:
+                    member.why = 'member timestamp: %s' % ts
                 findings.append(member)
-                text = ''
+
                 try:
                     text = payload.decode('utf-8', errors='ignore')
+                    if text.strip():
+                        did_engine = False
+                        if engine:
+                            try:
+                                sub = engine.analyze_string(text[:4096], info.filename)
+                                findings.extend(sub)
+                                did_engine = True
+                            except Exception:
+                                pass
+                        if not did_engine:
+                            findings.append(Finding(
+                                method='ZIP member text: %s' % info.filename,
+                                result_text=text[:2000],
+                                confidence='MEDIUM',
+                                note='Text content of ZIP member %s' % info.filename,
+                                source_label=source_label,
+                            ))
                 except Exception:
-                    text = ''
-                if text and is_mostly_printable(text, 0.80):
-                    conf, qnote = engine._text_quality(text) if engine else ('MEDIUM', 'printable text in zip member')
-                    tf = Finding(method=f'ZIP Member Text: {info.filename}', result_text=text, confidence=conf, note=note + '; ' + qnote)
-                    tf.parent_artifact = member.method
-                    findings.append(tf)
-                if engine and (ft or (text and len(text) > 8)):
-                    try:
-                        nested = engine.analyze_file(payload, f'{source_label}:{info.filename}') if ft else engine.analyze_string(text, f'{source_label}:{info.filename}')
-                        count = 0
-                        for s in nested[:16]:
-                            s.method = f'ZIP Nested [{info.filename}] -> ' + s.method
-                            s.parent_artifact = member.method
-                            findings.append(s)
-                            count += 1
-                        member.child_count = count
-                    except Exception:
-                        pass
+                    pass
+
+            # Inventory
+            if member_lines:
+                inv_text = '\n'.join(member_lines[:100])
+                findings.append(Finding(
+                    method='ZIP member inventory',
+                    result_text=inv_text,
+                    confidence='LOW',
+                    note='%d members, %d encrypted, %d nested archives' % (
+                        len(member_lines), len(encrypted_members), len(nested_archives)),
+                    source_label=source_label,
+                ))
+
+            if encrypted_members:
+                enc_text = '\n'.join(encrypted_members[:20])
+                findings.append(Finding(
+                    method='ZIP encrypted members detected',
+                    result_text=enc_text,
+                    confidence='HIGH',
+                    note='%d encrypted members -- password required' % len(encrypted_members),
+                    source_label=source_label,
+                ))
+
+            if nested_archives:
+                nest_text = '\n'.join(nested_archives[:10])
+                findings.append(Finding(
+                    method='ZIP nested archives detected',
+                    result_text=nest_text,
+                    confidence='MEDIUM',
+                    note='%d nested archive(s) within container' % len(nested_archives),
+                    source_label=source_label,
+                ))
+
+    except zipfile.BadZipFile as err:
+        findings.append(Finding(
+            method='ZIP parse error',
+            result_text=str(err),
+            confidence='LOW',
+            note='File has ZIP magic but could not be parsed: %s' % err,
+            source_label=source_label,
+        ))
     except Exception:
-        return []
+        pass
     return findings
+
 
 def _detect_appended_payload(data: bytes):
     ft = detect_filetype(data)
@@ -5865,6 +6455,323 @@ def _print_analyst_block(f, compact=False):
     if compact:
         return
 
+
+# ── IOC + Structure detection ─────────────────────────────────────────────
+_RE_IPV4    = re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b')
+_RE_IPV6    = re.compile(r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b')
+_RE_URL     = re.compile(r'https?://[^\s<>"\']{6,}', re.I)
+_RE_EMAIL   = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
+_RE_DOMAIN  = re.compile(r'\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+(?:com|net|org|io|gov|edu|co|uk|de|ru|cn|info|biz|xyz|onion)\b', re.I)
+_RE_MD5     = re.compile(r'\b[0-9a-fA-F]{32}\b')
+_RE_SHA1    = re.compile(r'\b[0-9a-fA-F]{40}\b')
+_RE_SHA256  = re.compile(r'\b[0-9a-fA-F]{64}\b')
+_RE_JWT     = re.compile(r'ey[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')
+_RE_PEM     = re.compile(r'-----BEGIN [A-Z ]+-----')
+_RE_CMD     = re.compile(r'(?:cmd\.exe|powershell|bash|sh|python|perl|ruby|wget|curl|nc|netcat)\s+[\-/]?\w', re.I)
+
+def _extract_iocs(text: str) -> List[Dict]:
+    """Extract indicators of compromise from any text string."""
+    if not text or len(text) < 4:
+        return []
+    iocs = []
+    seen = set()
+    def _add(kind, value, context=''):
+        key = (kind, value)
+        if key not in seen:
+            seen.add(key)
+            iocs.append({'type': kind, 'value': value, 'context': context})
+    for m in _RE_URL.finditer(text):
+        _add('url', m.group())
+    for m in _RE_EMAIL.finditer(text):
+        _add('email', m.group())
+    for m in _RE_IPV4.finditer(text):
+        v = m.group()
+        if not v.startswith(('127.', '0.', '255.')):
+            _add('ipv4', v)
+    for m in _RE_IPV6.finditer(text):
+        _add('ipv6', m.group())
+    for m in _RE_JWT.finditer(text):
+        _add('jwt', m.group()[:64] + '...')
+    for m in _RE_PEM.finditer(text):
+        _add('pem_block', m.group())
+    for m in _RE_CMD.finditer(text):
+        _add('command', m.group()[:80])
+    for m in _RE_SHA256.finditer(text):
+        _add('sha256', m.group())
+    for m in _RE_SHA1.finditer(text):
+        if not any(i['value'] == m.group() for i in iocs):
+            _add('sha1', m.group())
+    for m in _RE_MD5.finditer(text):
+        if not any(i['value'] == m.group() for i in iocs):
+            _add('md5', m.group())
+    for m in _RE_DOMAIN.finditer(text):
+        v = m.group()
+        if not any(i['value'] == v for i in iocs):
+            _add('domain', v)
+    return iocs[:40]
+
+
+def _detect_structured_type(text: str) -> str:
+    """Identify the primary structural type of decoded content."""
+    if not text:
+        return ''
+    t = text.strip()
+    # JSON
+    if (t.startswith('{') and t.endswith('}')) or (t.startswith('[') and t.endswith(']')):
+        try:
+            import json as _json; _json.loads(t); return 'json'
+        except Exception: pass
+    # PEM / key block
+    if '-----BEGIN' in t:
+        return 'pem'
+    # JWT
+    if _RE_JWT.search(t):
+        return 'jwt'
+    # XML / HTML
+    if t.startswith('<') and '>' in t:
+        tag = t[1:t.index('>')].split()[0] if '>' in t else ''
+        return 'html' if tag.lower() in ('html','head','body','div','script') else 'xml'
+    # YAML (rough)
+    if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*\s*:', t, re.M) and '\n' in t:
+        return 'yaml'
+    # INI / config
+    if re.match(r'^\[', t) and '=' in t:
+        return 'ini'
+    # URL list
+    urls = _RE_URL.findall(t)
+    if len(urls) >= 2:
+        return 'url_list'
+    if _RE_URL.match(t):
+        return 'url'
+    # CSV / TSV
+    lines_t = t.splitlines()[:5]
+    if len(lines_t) >= 2:
+        commas = [l.count(',') for l in lines_t]
+        tabs   = [l.count('\t') for l in lines_t]
+        if all(c == commas[0] and c >= 2 for c in commas): return 'csv'
+        if all(c == tabs[0]   and c >= 1 for c in tabs):   return 'tsv'
+    # Log line
+    if re.search(r'\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}', t):
+        return 'log'
+    # Command
+    if _RE_CMD.search(t):
+        return 'command'
+    # Base64 blob
+    if re.match(r'^[A-Za-z0-9+/=\s]{40,}$', t) and len(t) % 4 == 0:
+        return 'base64_blob'
+    return ''
+
+
+def _corroborate_findings(findings: list) -> None:
+    """
+    Cross-reference IOCs across all findings.
+    When multiple findings share the same IOC value, increment support_count
+    on each and annotate why.
+    """
+    ioc_index: Dict[str, List] = {}   # ioc_value -> [finding, ...]
+    for f in findings:
+        for ioc in (getattr(f, 'iocs', None) or []):
+            v = ioc.get('value', '')
+            if v:
+                ioc_index.setdefault(v, []).append(f)
+    for v, flist in ioc_index.items():
+        if len(flist) >= 2:
+            methods = list({f.method for f in flist})[:3]
+            note    = f'corroborated by: {", ".join(methods)}'
+            for f in flist:
+                f.support_count = len(flist)
+                if note not in (f.why or ''):
+                    f.why = ((f.why + '; ') if f.why else '') + note
+
+
+
+def _structured_content_findings(text: str, source_label: str) -> list:
+    """
+    When decoded text contains structured content (JSON, JWT, PEM, URLs, etc.),
+    produce a dedicated finding with extracted fields for analyst review.
+    Ticket 2.1: structured-content detectors.
+    """
+    import json as _json
+    findings = []
+    if not text or len(text) < 8:
+        return findings
+
+    t = text.strip()
+    stype = _detect_structured_type(t)
+
+    # JSON: extract top-level keys + IOCs
+    if stype == 'json':
+        try:
+            obj = _json.loads(t)
+            def _flat(d, depth=0, prefix=''):
+                items = {}
+                if isinstance(d, dict) and depth < 3:
+                    for k, v in d.items():
+                        items.update(_flat(v, depth+1, prefix + str(k) + '.'))
+                elif isinstance(d, (str, int, float, bool)):
+                    items[prefix.rstrip('.')] = str(d)[:200]
+                return items
+            flat = _flat(obj)
+            preview = '  '.join('%s=%s' % (k, v) for k, v in list(flat.items())[:12])
+            findings.append(Finding(
+                method='Structured content: JSON',
+                result_text=preview,
+                confidence='HIGH',
+                note='JSON object with %d top-level keys' % (len(obj) if isinstance(obj, dict) else 1),
+                source_label=source_label,
+                structured_type='json',
+            ))
+        except Exception:
+            pass
+
+    # JWT: decode header + payload
+    elif stype == 'jwt':
+        import base64 as _b64
+        try:
+            parts = t.strip().split('.')
+            if len(parts) >= 2:
+                def _b64d(s):
+                    s += '=' * (-len(s) % 4)
+                    return _b64.urlsafe_b64decode(s).decode('utf-8', errors='replace')
+                header  = _json.loads(_b64d(parts[0]))
+                payload = _json.loads(_b64d(parts[1]))
+                summary = 'alg=%s  typ=%s  claims=%s' % (
+                    header.get('alg','?'), header.get('typ','?'),
+                    ', '.join('%s=%s' % (k, str(v)[:30]) for k,v in list(payload.items())[:6])
+                )
+                findings.append(Finding(
+                    method='Structured content: JWT',
+                    result_text=summary,
+                    confidence='HIGH',
+                    note='JWT token decoded: header=%s' % _json.dumps(header)[:100],
+                    source_label=source_label,
+                    structured_type='jwt',
+                ))
+        except Exception:
+            pass
+
+    # PEM block: identify key type
+    elif stype == 'pem':
+        import re as _re
+        for m in _re.finditer(r'-----BEGIN ([^-]+)-----', t):
+            findings.append(Finding(
+                method='Structured content: PEM block',
+                result_text=m.group(0),
+                confidence='HIGH',
+                note='PEM-encoded cryptographic material: %s' % m.group(1).strip(),
+                source_label=source_label,
+                structured_type='pem',
+            ))
+
+    # URL list: extract all URLs as structured finding
+    elif stype in ('url', 'url_list'):
+        urls = _RE_URL.findall(t)
+        if urls:
+            findings.append(Finding(
+                method='Structured content: URLs extracted',
+                result_text='\n'.join(urls[:20]),
+                confidence='HIGH' if len(urls) >= 3 else 'MEDIUM',
+                note='%d URL(s) extracted from decoded content' % len(urls),
+                source_label=source_label,
+                structured_type='url_list',
+                iocs=[{'type': 'url', 'value': u} for u in urls[:20]],
+            ))
+
+    # Log: surface timestamp ranges
+    elif stype == 'log':
+        import re as _re
+        ts_matches = _re.findall(r'\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}', t)
+        if ts_matches:
+            findings.append(Finding(
+                method='Structured content: log data',
+                result_text=t[:500],
+                confidence='MEDIUM',
+                note='Log format detected. %d timestamps. Range: %s to %s' % (
+                    len(ts_matches), ts_matches[0], ts_matches[-1]),
+                source_label=source_label,
+                structured_type='log',
+            ))
+
+    return findings
+
+
+
+def _build_why(f) -> str:
+    """
+    Construct a human-readable rationale string for a finding.
+    Ticket 5.3: explainability hardening.
+    """
+    parts = []
+    m     = f.method or ''
+    conf  = f.confidence
+    score = getattr(f, 'score', 0)
+    chain = getattr(f, 'chain', []) or []
+    stype = getattr(f, 'structured_type', '') or ''
+    iocs  = getattr(f, 'iocs', []) or []
+    supp  = getattr(f, 'support_count', 1)
+    ent   = getattr(f, 'entropy', 0.0)
+    rt    = f.result_text or ''
+
+    if chain and len(chain) > 1:
+        parts.append('Recovered via chain: %s.' % ' -> '.join(chain))
+
+    if stype:
+        parts.append('Output is structured %s.' % stype.upper())
+
+    if iocs:
+        kinds = sorted({i['type'] for i in iocs})
+        parts.append('Contains %d IOC(s): %s.' % (len(iocs), ', '.join(kinds)))
+
+    if supp > 1:
+        parts.append('Independently corroborated by %d passes.' % supp)
+
+    if rt and len(rt) > 12:
+        ratio = sum(1 for c in rt if c.isalpha()) / max(1, len(rt))
+        if ratio > 0.6:
+            parts.append('Output is %.0f%% alphabetic -- likely natural language.' % (ratio * 100))
+
+    if ent > 0:
+        if ent > 7.2:
+            parts.append('Output entropy %.2f -- high (compressed or encrypted).' % ent)
+        elif ent < 2.0 and len(rt) > 20:
+            parts.append('Output entropy %.2f -- low (repetitive or structured).' % ent)
+
+    if 'AES' in m or 'aes' in m.lower():
+        parts.append('Blob length and entropy profile match AES key material.')
+
+    if 'ROT' in m:
+        parts.append('Caesar/ROT cipher: letter substitution by fixed offset.')
+
+    if 'base64' in m.lower() or 'Base64' in m:
+        parts.append('Base64 encoding: standard RFC 4648 alphabet.')
+
+    if 'XOR' in m:
+        parts.append('XOR decoded: key derived via frequency analysis.')
+
+    if 'Vigenere' in m or 'Vigenère' in m:
+        parts.append('Vigenere cipher: key recovered via Kasiski examination and IC analysis.')
+
+    if 'LSB' in m or 'lsb' in m:
+        parts.append('Steganographic LSB embedding: data hidden in image channel bit-planes.')
+
+    if 'EXIF' in m:
+        parts.append('EXIF metadata field extracted from JPEG segment.')
+
+    if 'JSteg' in m or 'DCT' in m:
+        parts.append('JPEG DCT coefficient LSB steganography (JSteg method).')
+
+    if score >= 80:
+        parts.append('Score %d -- strong language fitness and/or structure indicators.' % score)
+    elif score >= 55:
+        parts.append('Score %d -- above high-confidence threshold.' % score)
+
+    if conf == 'CONFIRMED':
+        parts.append('Confidence CONFIRMED: English language detection passed.')
+
+    return '  '.join(parts) if parts else 'Found by %s.' % m
+
+
+
 def _finalize_findings(findings, source_label, wordlist=None):
     """
     Score, deduplicate, sort, and annotate all findings.
@@ -5890,6 +6797,40 @@ def _finalize_findings(findings, source_label, wordlist=None):
         if 'ZIP Nested' in m:    f.score += 5
         if 'Appended Payload' in m: f.score += 4
         f.rrsw_signal = _rrsw_signal(f.score, f.entropy, f.confidence)
+        # Phase-1: provenance, IOC, structured-content enrichment
+        _fid = getattr(f, 'finding_id', '')
+        if not _fid:
+            import hashlib as _hl
+            _key = f'{f.method}{f.result_text or ""}{f.source_label}'
+            try:
+                f.finding_id = _hl.md5(_key.encode('utf-8', 'replace')).hexdigest()[:12]
+            except AttributeError:
+                pass
+        _fiocs = getattr(f, 'iocs', None)
+        if _fiocs is None:
+            try: f.iocs = []
+            except AttributeError: pass
+        if f.result_text and not getattr(f, 'iocs', []):
+            try: f.iocs = _extract_iocs(f.result_text)
+            except AttributeError: pass
+        _fstype = getattr(f, 'structured_type', None)
+        if _fstype is None:
+            try: f.structured_type = ''
+            except AttributeError: pass
+        if f.result_text and not getattr(f, 'structured_type', ''):
+            try: f.structured_type = _detect_structured_type(f.result_text)
+            except AttributeError: pass
+        # Boost score for structured content with IOCs
+        _fiocs2 = getattr(f, 'iocs', []) or []
+        if _fiocs2:
+            f.score = f.score + min(len(_fiocs2) * 3, 18)
+        _fstype2 = getattr(f, 'structured_type', '') or ''
+        if _fstype2 in ('json', 'xml', 'pem', 'jwt', 'yaml'):
+            f.score = f.score + 12
+        # Generate structured findings for high-value content types
+        if _fstype2 in ('json', 'jwt', 'pem', 'url', 'url_list', 'log') and f.result_text:
+            _struct_extras = _structured_content_findings(f.result_text, f.source_label or source_label)
+            seen_method_key.update({_k: _sf for _k, _sf in {(_sf.method + _sf.source_label): _sf for _sf in _struct_extras}.items()})
         if f.score >= 95 and f.rrsw_signal != 'RRSW-SIGMA':
             f.rrsw_signal = 'RRSW-SIGMA'
         bundle = _analyst_bundle(f)
@@ -5924,7 +6865,11 @@ def _finalize_findings(findings, source_label, wordlist=None):
         if raw and f.confidence in ('HIGH', 'CONFIRMED'):
             xk = estimate_repeating_xor_keysizes(raw[:512], top_n=3)
             if xk: why_bits.append('xor keysizes: ' + ', '.join(map(str, xk)))
-        f.why = '; '.join(dict.fromkeys(w for w in why_bits if w))[:900]
+        raw_why = '; '.join(dict.fromkeys(w for w in why_bits if w))[:900]
+        f.why = raw_why if raw_why else _build_why(f)
+        # Explainability requirement: HIGH/CONFIRMED must always have a why
+        if f.confidence in ('HIGH', 'CONFIRMED') and not f.why:
+            f.why = _build_why(f)
         key = (m, txt[:400], bytes(raw[:64]) if raw else b'', getattr(f, 'note', '')[:160])
         prev = seen_method_key.get(key)
         cur  = (f.score, len(txt), len(raw), -f.entropy)
@@ -5996,7 +6941,6 @@ def _finalize_findings(findings, source_label, wordlist=None):
             clean.append(f)
     deduped = clean
 
-    #https://orcid.org/0009-0003-9145-3987
     # ── PER-FAMILY CAP ───────────────────────────────────────────────────────
     # Prevent ROT1-25 all showing as HIGH, or 80 Vigenere variants flooding output.
     # Structural/analysis findings (cipher profile, param hints, triage) are uncapped.
@@ -6061,6 +7005,7 @@ def _finalize_findings(findings, source_label, wordlist=None):
 
     # Final sort
     capped.sort(key=lambda f: (conf_rank.get(f.confidence, 0), f.score, -f.entropy), reverse=True)
+    _corroborate_findings(capped)
     return capped
 
 
@@ -6481,8 +7426,14 @@ def _fresh_analyze_file(self, data: bytes, filename: str):
     findings = []
     pr = _ACTIVE_PROGRESS
 
+    _upd_t = [None]
     def _upd(label):
+        import time as _t
+        now = _t.monotonic()
         if pr: pr.update(label)
+        if _upd_t[0] is not None:
+            _pass_record(label, 'ok', now - _upd_t[0])
+        _upd_t[0] = now
 
     _upd('file type detection')
     ft = detect_filetype(data)
@@ -6508,6 +7459,10 @@ def _fresh_analyze_file(self, data: bytes, filename: str):
     if data[:3] == b'\xFF\xD8\xFF':
         _upd('JPEG metadata analysis')
         findings += self._analyze_jpeg(data)
+    _upd('binary format triage')
+    bin_triage = _triage_binary_format(data, filename)
+    if bin_triage:
+        findings.extend(bin_triage)
     if data[:4] == b'PK\x03\x04':
         _upd('ZIP member extraction')
         findings += self._analyze_zip(data)
@@ -7795,6 +8750,382 @@ def save_report(report_text: str, run_dir: str) -> str:
     with open(path, 'w', encoding='utf-8', errors='replace') as fh: fh.write(report_text)
     return path
 
+
+def _save_jsonl(findings, source_label, path):
+    import json as _json
+    with open(path, 'w', encoding='utf-8') as fh:
+        for f in findings:
+            obj = {
+                'finding_id':      getattr(f, 'finding_id', ''),
+                'source':          source_label,
+                'method':          getattr(f, 'method', ''),
+                'confidence':      getattr(f, 'confidence', 'LOW'),
+                'signal':          getattr(f, 'rrsw_signal', 'RRSW-NOISE'),
+                'score':           getattr(f, 'score', 0),
+                'entropy':         round(getattr(f, 'entropy', 0.0), 3),
+                'structured_type': getattr(f, 'structured_type', ''),
+                'support_count':   getattr(f, 'support_count', 1),
+                'chain':           getattr(f, 'chain', []) or [],
+                'iocs':            getattr(f, 'iocs', []) or [],
+                'why':             getattr(f, 'why', ''),
+                'note':            (getattr(f, 'note', '') or '')[:400],
+                'result_text':     (getattr(f, 'result_text', None) or '')[:2000] or None,
+                'byte_offset':     getattr(f, 'byte_offset', -1),
+                'input_sha256':    getattr(f, 'input_sha256', ''),
+                'timestamp':       str(getattr(f, 'timestamp', '')),
+            }
+            fh.write(_json.dumps(obj, ensure_ascii=False) + '\n')
+
+
+def _save_html_report(findings, source_label, input_preview, path):
+    import json as _json, html as _hl
+    import datetime as _dt
+
+    ts = _dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    conf_rank = {'CONFIRMED': 3, 'HIGH': 2, 'MEDIUM': 1, 'LOW': 0}
+    sorted_f  = sorted(findings,
+                       key=lambda f: (conf_rank.get(f.confidence, 0), f.score),
+                       reverse=True)
+    conf_colors = {
+        'CONFIRMED': '#39FF14', 'HIGH': '#ff4444',
+        'MEDIUM':    '#ffaa00', 'LOW':  '#888899',
+    }
+
+    def esc(s):
+        return _hl.escape(str(s or ''))
+
+    def finding_row(f, idx):
+        col    = conf_colors.get(f.confidence, '#888899')
+        method = esc(f.method or '')
+        conf   = esc(f.confidence)
+        score  = getattr(f, 'score', 0)
+        result = esc((f.result_text or '')[:600])
+        why    = esc(f.why or '')
+        chain  = esc(' -> '.join(getattr(f, 'chain', []) or []))
+        stype  = esc(getattr(f, 'structured_type', '') or '')
+        supp   = getattr(f, 'support_count', 1)
+        iocs   = getattr(f, 'iocs', []) or []
+        fid    = esc(getattr(f, 'finding_id', '') or '')
+        rb     = getattr(f, 'result_bytes', None)
+        hx     = rb[:64].hex() if rb else ''
+
+        ioc_rows = ''
+        for ioc in iocs[:10]:
+            ioc_rows += (
+                '<tr>'
+                '<td style="color:#aaa;font-size:11px;padding:1px 8px">' + esc(ioc.get('type','')) + '</td>'
+                '<td style="font-family:monospace;font-size:11px;padding:1px 8px">' + esc(ioc.get('value','')) + '</td>'
+                '</tr>'
+            )
+        ioc_table = ('<table style="margin-top:6px;border-collapse:collapse">' + ioc_rows + '</table>') if ioc_rows else ''
+
+        badges = ''
+        if stype:
+            badges += '<span style="background:#1e3a5f;color:#7ab3e0;padding:1px 6px;border-radius:3px;font-size:10px;margin-right:4px">' + stype + '</span>'
+        if supp > 1:
+            badges += '<span style="background:#1a3a1a;color:#39FF14;padding:1px 6px;border-radius:3px;font-size:10px">corroborated x' + str(supp) + '</span>'
+
+        hex_block = ''
+        if hx:
+            hex_block = '<div style="font-family:monospace;font-size:10px;color:#555;margin-top:4px">' + esc(hx) + '...</div>'
+
+        return (
+            '<div style="border:1px solid #2a2a3a;border-left:3px solid ' + col + ';padding:10px 14px;margin:6px 0;background:#111118;border-radius:4px">'
+            '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">'
+            '<span style="color:' + col + ';font-weight:500;font-size:12px">[' + conf + ']</span>'
+            '<span style="color:#ddd;font-size:12px">' + method + '</span>'
+            '<span style="color:#555;font-size:11px">score ' + str(score) + '</span>'
+            '<span style="color:#444;font-size:10px;margin-left:auto">#' + fid + '</span>'
+            '</div>'
+            + badges
+            + '<div style="font-family:monospace;font-size:12px;color:#c8ffb0;margin-top:6px;white-space:pre-wrap;word-break:break-all">' + result + '</div>'
+            + hex_block
+            + ioc_table
+            + '<details style="margin-top:6px"><summary style="color:#555;font-size:11px;cursor:pointer">why / chain</summary>'
+            '<div style="color:#666;font-size:11px;margin-top:4px">' + why + '</div>'
+            '<div style="color:#555;font-size:11px;font-family:monospace">' + chain + '</div>'
+            '</details>'
+            '</div>'
+        )
+
+    # IOC summary across all findings
+    all_iocs = {}
+    for f in sorted_f:
+        for ioc in (getattr(f, 'iocs', []) or []):
+            t = ioc.get('type', '')
+            all_iocs.setdefault(t, set()).add(ioc.get('value', ''))
+
+    ioc_summary = ''
+    if all_iocs:
+        rows = ''
+        for t, vals in sorted(all_iocs.items()):
+            for v in sorted(vals)[:8]:
+                rows += (
+                    '<tr>'
+                    '<td style="color:#aaa;font-size:11px;padding:2px 8px">' + esc(t) + '</td>'
+                    '<td style="font-family:monospace;font-size:11px;padding:2px 8px">' + esc(v) + '</td>'
+                    '</tr>'
+                )
+        ioc_summary = (
+            '<div style="background:#0a0a18;border:1px solid #1e2a1e;border-radius:6px;padding:12px;margin-bottom:18px">'
+            '<div style="color:#39FF14;font-weight:500;margin-bottom:8px;font-size:12px">extracted indicators</div>'
+            '<table style="border-collapse:collapse">' + rows + '</table>'
+            '</div>'
+        )
+
+    counts = {'CONFIRMED': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+    for f in sorted_f:
+        counts[f.confidence] = counts.get(f.confidence, 0) + 1
+
+    count_pills = ''
+    for c in ('CONFIRMED', 'HIGH', 'MEDIUM', 'LOW'):
+        if counts.get(c):
+            col = conf_colors[c]
+            count_pills += (
+                '<span class="count-pill" style="background:' + col + '22;color:' + col + '">'
+                + str(counts[c]) + ' ' + c
+                + '</span>'
+            )
+
+    findings_html = ''.join(finding_row(f, i) for i, f in enumerate(sorted_f[:50], 1))
+    overflow = ''
+    if len(sorted_f) > 50:
+        overflow = '<div style="color:#555;font-size:11px;margin-top:12px">... and ' + str(len(sorted_f)-50) + ' more findings in --report --json</div>'
+
+    html = (
+        '<!DOCTYPE html>\n'
+        '<html><head><meta charset="utf-8">\n'
+        '<title>Hash It Out -- ' + esc(source_label) + '</title>\n'
+        '<style>\n'
+        '*{box-sizing:border-box;margin:0;padding:0}\n'
+        'body{background:#0d0d1a;color:#ccc;font-family:system-ui,sans-serif;padding:24px;line-height:1.5}\n'
+        'h1{color:#39FF14;font-size:18px;font-weight:500;margin-bottom:4px}\n'
+        'h2{color:#7ab3e0;font-size:13px;font-weight:500;margin:18px 0 6px;letter-spacing:.06em;text-transform:uppercase}\n'
+        '.meta{color:#555;font-size:11px;margin-bottom:20px}\n'
+        '.counts{display:flex;gap:16px;margin-bottom:18px}\n'
+        '.count-pill{padding:3px 10px;border-radius:4px;font-size:11px;font-weight:500}\n'
+        '</style>\n'
+        '</head><body>\n'
+        '<h1>Hash It Out</h1>\n'
+        '<div class="meta">source: ' + esc(source_label) + ' &nbsp;·&nbsp; ' + ts + ' &nbsp;·&nbsp; ' + str(len(sorted_f)) + ' findings</div>\n'
+        '<div class="counts">' + count_pills + '</div>\n'
+        '<h2>input preview</h2>\n'
+        '<div style="font-family:monospace;font-size:11px;color:#666;background:#0a0a18;padding:8px;border-radius:4px;margin-bottom:18px;white-space:pre-wrap">' + esc(input_preview[:300]) + '</div>\n'
+        + ioc_summary
+        + '<h2>findings</h2>\n'
+        + findings_html
+        + overflow
+        + '\n</body></html>'
+    )
+
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(html)
+
+
+def _parse_exif_simple(seg_data: bytes) -> str:
+    """Extract key EXIF fields from an APP1 segment without PIL."""
+    import struct
+    try:
+        tiff = seg_data[6:]
+        if len(tiff) < 8: return ''
+        bom = tiff[:2]
+        endian = '<' if bom == b'II' else '>' if bom == b'MM' else None
+        if not endian: return ''
+        ifd_off = struct.unpack(endian + 'I', tiff[4:8])[0]
+        if ifd_off + 2 > len(tiff): return ''
+        n = struct.unpack(endian + 'H', tiff[ifd_off:ifd_off+2])[0]
+        TAGS = {0x010F:'Make',0x0110:'Model',0x0132:'DateTime',
+                0x013B:'Artist',0x8298:'Copyright',0x0131:'Software',
+                0x9003:'DateTimeOriginal',0xA002:'PixelXDimension',0xA003:'PixelYDimension'}
+        out = []
+        pos = ifd_off + 2
+        for _ in range(min(n, 32)):
+            if pos + 12 > len(tiff): break
+            tag, typ, count, vraw = struct.unpack(endian + 'HHI4s', tiff[pos:pos+12])
+            pos += 12
+            if tag not in TAGS: continue
+            if typ == 2:
+                voff = struct.unpack(endian + 'I', vraw)[0] if count > 4 else 0
+                val = (tiff[voff:voff+count] if count <= 4 or voff+count <= len(tiff)
+                       else vraw[:4]).rstrip(b'\x00').decode('utf-8', errors='replace')
+                if val.strip(): out.append(f"{TAGS[tag]}: {val.strip()}")
+            elif typ in (3, 4):
+                voff = struct.unpack(endian + 'I', vraw)[0] if typ==4 else struct.unpack(endian + 'H', vraw[:2])[0]
+                out.append(f"{TAGS[tag]}: {voff}")
+        return '  '.join(out[:10])
+    except Exception: return ''
+
+
+def _parse_iptc_simple(seg_data: bytes) -> str:
+    """Extract IPTC fields from a Photoshop APP13 block."""
+    import struct
+    IPTC = {5:'ObjectName',25:'Keywords',80:'Byline',85:'BylineTitle',
+            90:'City',92:'State',95:'Country',105:'Headline',110:'Credit',
+            115:'Source',116:'Copyright',120:'Caption',55:'DateCreated'}
+    out = []
+    pos = 0
+    try:
+        while pos < len(seg_data) - 4:
+            if seg_data[pos] != 0x1C: pos += 1; continue
+            rec = seg_data[pos+1]; tag = seg_data[pos+2]
+            length = struct.unpack('>H', seg_data[pos+3:pos+5])[0]
+            val = seg_data[pos+5:pos+5+length]
+            pos += 5 + length
+            if rec == 2 and tag in IPTC:
+                out.append(f"{IPTC[tag]}: {val.decode('utf-8', errors='replace').strip()}")
+        return '  '.join(out[:12])
+    except Exception: return ''
+
+
+def _triage_pe(data: bytes, source_label: str) -> list:
+    """PE (Windows executable) header triage — arch, timestamp, sections, entropy."""
+    import struct
+    findings = []
+    try:
+        if data[:2] != b'MZ': return []
+        pe_off = struct.unpack('<I', data[0x3c:0x40])[0]
+        if pe_off + 24 > len(data) or data[pe_off:pe_off+4] != b'PE\x00\x00': return []
+        machine = struct.unpack('<H', data[pe_off+4:pe_off+6])[0]
+        n_sec   = struct.unpack('<H', data[pe_off+6:pe_off+8])[0]
+        tstamp  = struct.unpack('<I', data[pe_off+8:pe_off+12])[0]
+        opt_sz  = struct.unpack('<H', data[pe_off+20:pe_off+22])[0]
+        chars   = struct.unpack('<H', data[pe_off+22:pe_off+24])[0]
+        arch_n  = {0x14c:'x86',0x8664:'x64',0x1c0:'ARM',0xaa64:'ARM64'}.get(machine, f'0x{machine:04x}')
+        kind    = 'DLL' if chars & 0x2000 else 'EXE'
+        import datetime as _dt
+        ts_str  = _dt.datetime.utcfromtimestamp(tstamp).strftime('%Y-%m-%d %H:%M:%S UTC')
+        lines2  = [f'type:{kind}  arch:{arch_n}  sections:{n_sec}  compiled:{ts_str}']
+        sec_off = pe_off + 24 + opt_sz
+        for i in range(min(n_sec, 16)):
+            so = sec_off + i*40
+            if so + 40 > len(data): break
+            name    = data[so:so+8].rstrip(b'\x00').decode('ascii', errors='replace')
+            raw_off = struct.unpack('<I', data[so+20:so+24])[0]
+            raw_sz  = struct.unpack('<I', data[so+16:so+20])[0]
+            ch      = struct.unpack('<I', data[so+36:so+40])[0]
+            sd      = data[raw_off:raw_off+raw_sz] if raw_off+raw_sz <= len(data) else b''
+            ent     = _hio_entropy(sd) if sd else 0.0
+            flag    = 'X' if ch & 0x20000000 else ' '
+            lines2.append(f'  {name:<10} raw={raw_sz:>6,}  entropy={ent:.2f}  [{flag}]')
+        note = f'{kind} {arch_n}, compiled {ts_str}'
+        high_ent = [l for l in lines2 if 'entropy=7.' in l or 'entropy=8.' in l]
+        if high_ent: lines2.append(f'WARNING: {len(high_ent)} high-entropy section(s) — possible packing')
+        findings.append(Finding(method='PE triage', result_text='\n'.join(lines2),
+                                confidence='HIGH' if high_ent else 'MEDIUM',
+                                note=note, source_label=source_label))
+    except Exception: pass
+    return findings
+
+
+def _triage_elf(data: bytes, source_label: str) -> list:
+    """ELF binary triage — class, arch, type, interpreter."""
+    import struct
+    findings = []
+    try:
+        if data[:4] != b'\x7fELF': return []
+        ei_class = data[4]; ei_data = data[5]
+        endian   = '<' if ei_data == 1 else '>'
+        bits     = 32 if ei_class == 1 else 64
+        e_type   = struct.unpack(endian+'H', data[16:18])[0]
+        e_mach   = struct.unpack(endian+'H', data[18:20])[0]
+        types    = {1:'relocatable',2:'executable',3:'shared',4:'core'}
+        machines = {0x03:'x86',0x3E:'x86-64',0x28:'ARM',0xB7:'AArch64',0x08:'MIPS'}
+        t_str    = types.get(e_type, f'type-{e_type}')
+        m_str    = machines.get(e_mach, f'arch-0x{e_mach:x}')
+        e_shnum  = struct.unpack(endian+'H', data[60:62] if bits==64 else data[48:50])[0]
+        e_phnum  = struct.unpack(endian+'H', data[56:58] if bits==64 else data[44:46])[0]
+        interp   = ''
+        for tag in (b'/lib/', b'/usr/lib/'):
+            idx = data.find(tag)
+            if idx > 0:
+                end = data.index(b'\x00', idx)
+                interp = data[idx:end].decode('ascii', errors='replace')
+                break
+        summary  = f'{bits}-bit {t_str}  arch:{m_str}  sections:{e_shnum}  segments:{e_phnum}'
+        if interp: summary += f'  interp:{interp}'
+        findings.append(Finding(method='ELF triage', result_text=summary,
+                                confidence='MEDIUM', source_label=source_label))
+    except Exception: pass
+    return findings
+
+
+def _triage_pdf(data: bytes, source_label: str) -> list:
+    """PDF triage — version, page count, suspicious indicator flags."""
+    import re as _re
+    findings = []
+    try:
+        if not data.startswith(b'%PDF-'): return []
+        ver  = (_re.match(rb'%PDF-(\d+\.\d+)', data) or [None,b'?'])[1]
+        ver  = ver.decode() if isinstance(ver, bytes) else '?'
+        n_obj    = len(_re.findall(rb'\d+ \d+ obj', data))
+        n_streams= len(_re.findall(rb'stream\r?\n', data))
+        pg_m     = _re.search(rb'/Count\s+(\d+)', data)
+        n_pages  = pg_m.group(1).decode() if pg_m else '?'
+        flags    = []
+        if _re.search(rb'/JavaScript|/JS\b', data):    flags.append('JavaScript')
+        if _re.search(rb'/Launch', data):               flags.append('Launch action')
+        if _re.search(rb'/EmbeddedFile', data):         flags.append('EmbeddedFile')
+        if _re.search(rb'/OpenAction', data):           flags.append('OpenAction')
+        if _re.search(rb'/Encrypt', data):              flags.append('Encrypted')
+        if _re.search(rb'/AcroForm', data):             flags.append('AcroForm')
+        summary = f'PDF {ver}  pages:{n_pages}  objects:{n_obj}  streams:{n_streams}'
+        if flags: summary += f'\nflags: {", ".join(flags)}'
+        conf = 'HIGH' if any(f in ('JavaScript','Launch action','EmbeddedFile') for f in flags) else 'MEDIUM'
+        findings.append(Finding(method='PDF triage', result_text=summary,
+                                confidence=conf,
+                                note=f'PDF v{ver}, flags: {", ".join(flags) or "none"}',
+                                source_label=source_label))
+    except Exception: pass
+    return findings
+
+
+def _triage_binary_format(data: bytes, source_label: str) -> list:
+    """Dispatch to PE/ELF/PDF triage."""
+    results = []
+    if not data or len(data) < 8: return results
+    if data[:2] == b'MZ':         results.extend(_triage_pe(data, source_label))
+    if data[:4] == b'\x7fELF':   results.extend(_triage_elf(data, source_label))
+    if data[:4] == b'%PDF':       results.extend(_triage_pdf(data, source_label))
+    return results
+
+
+def _build_timeline(findings) -> list:
+    """Extract timestamps from findings and return sorted (datetime_str, method) pairs."""
+    import re as _re
+    timeline, seen = [], set()
+    PATS = [
+        _re.compile(r'\b(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})'),
+        _re.compile(r'\b(\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2})'),
+        _re.compile(r'\b(\d{4}-\d{2}-\d{2})\b'),
+    ]
+    for f in findings:
+        txt = f.result_text or ''
+        if not txt: continue
+        method = f.method or ''
+        for pat in PATS:
+            for m in pat.finditer(txt):
+                raw  = m.group(1)
+                norm = raw.replace(':','-',2) if re.match(r'\d{4}:\d{2}:\d{2}', raw) else raw
+                key  = (norm, method[:40])
+                if key not in seen:
+                    seen.add(key)
+                    timeline.append((norm, method[:50]))
+    timeline.sort(key=lambda x: x[0])
+    return timeline[:100]
+
+
+def _format_timeline(timeline) -> str:
+    if not timeline: return ''
+    out, prev = [], ''
+    for ts, src_method in timeline:
+        date = ts[:10]
+        if date != prev:
+            out.append(f'  {date}')
+            prev = date
+        out.append(f'    {ts}  {src_method}')
+    return '\n'.join(out)
+
+
 def generate_text_report(findings, source_label, input_preview, saved_files):
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     lines = [
@@ -7839,6 +9170,11 @@ def generate_text_report(findings, source_label, input_preview, saved_files):
             f'  why        : {getattr(lead, "why", "")}',
             ''
         ]
+    # Timeline
+    timeline = _build_timeline(findings)
+    if timeline:
+        tl_text = _format_timeline(timeline)
+        lines += ['-' * 88, 'timeline:', tl_text, '']
     lines += ['-' * 88, 'findings:', '']
     for i, f in enumerate(findings, 1):
         lines.append(f'[{i:03d}] method      : {f.method}')
@@ -7857,7 +9193,7 @@ def generate_text_report(findings, source_label, input_preview, saved_files):
         elif getattr(f, 'result_bytes', None):
             lines.append(f'     bytes       : {len(f.result_bytes):,}')
         lines.append('')
-    lines += ['=' * 88, f'Hash It Out v{VERSION}  -  github.com/RRSWSEC/Hash-It-Out', '=' * 88]
+    lines += ['=' * 88, 'Hash It Out  -  github.com/RRSWSEC/Hash-It-Out', '=' * 88]
     return '\n'.join(lines)
 
 def save_csv_report(findings, source_label, run_dir: str):
@@ -7922,6 +9258,35 @@ def _write_report(findings, source_label, input_data, saved_files,
         with open(jpath, 'w', encoding='utf-8') as fh: import json; json.dump(j, fh, indent=2)
         if not quiet: print(f"  {C.GREEN}[+] json saved : {jpath}{C.RESET}")
     if not quiet: print(f"  {C.GREEN}[+] report saved: {report_path}{C.RESET}")
+    # Analyst profile: auto-write JSONL alongside text report
+    if flags.get('analyst') and _save_jsonl:
+        _auto_jsonl = report_path.replace('.txt', '.jsonl')
+        try:
+            _save_jsonl(findings, source_label, _auto_jsonl)
+            if not quiet:
+                print(f"  {C.GREEN}[+] JSONL saved : {_auto_jsonl}{C.RESET}")
+        except Exception:
+            pass
+    # JSONL export
+    _out_jsonl = getattr(flags, 'out_jsonl', None) or ''
+    if not _out_jsonl:
+        import sys as _sys
+        for i, a in enumerate(_sys.argv):
+            if a in ('--out-jsonl', '--out_jsonl') and i+1 < len(_sys.argv):
+                _out_jsonl = _sys.argv[i+1]; break
+    if _out_jsonl:
+        _save_jsonl(findings, source_label, _out_jsonl)
+        if not quiet: print(f"  {C.GREEN}[+] JSONL saved : {_out_jsonl}{C.RESET}")
+    # HTML report
+    _out_html = getattr(flags, 'out_html', None) or ''
+    if not _out_html:
+        import sys as _sys
+        for i, a in enumerate(_sys.argv):
+            if a in ('--out-html', '--out_html') and i+1 < len(_sys.argv):
+                _out_html = _sys.argv[i+1]; break
+    if _out_html:
+        _save_html_report(findings, source_label, str(input_data)[:500], _out_html)
+        if not quiet: print(f"  {C.GREEN}[+] HTML report : {_out_html}{C.RESET}")
 
 def _save_findings(findings, flags, run_dir, source_label):
     saved = []
@@ -8050,9 +9415,46 @@ def run_from_dir(dirpath, flags, output_base, wordlist,
     if not quiet:
         print(f"\n{C.CYAN}[*] directory: {C.WHITE}{dirpath}{C.RESET}")
         print(f"{C.CYAN}[*] files    : {C.WHITE}{len(files)}{C.RESET}")
+    case_findings = []
     for filepath in files:
         run_from_file(filepath, flags, output_base, wordlist,
                       quiet, nodelay, save_json, max_depth, stegopw_wordlist)
+    # ── Case-wide summary ─────────────────────────────────────────────
+    if not quiet and len(files) > 1:
+        import hashlib as _hl
+        print()
+        print(f"  {C.TOXGRN}{'='*_W}{C.RESET}")
+        print(f"  {C.TOXGRN}  CORPUS SUMMARY  --  {len(files)} files analyzed{C.RESET}")
+        print(f"  {C.TOXGRN}{'='*_W}{C.RESET}")
+        # Re-scan output dir for all CSV reports to aggregate findings
+        csv_dir = output_base
+        import glob as _glob, csv as _csv
+        all_csvs = sorted(_glob.glob(os.path.join(csv_dir, '**', 'HIO_findings_*.csv'), recursive=True))
+        if all_csvs:
+            conf_counts: dict = {}
+            method_counts: dict = {}
+            ioc_types: dict = {}
+            for csv_path in all_csvs:
+                try:
+                    with open(csv_path, newline='', encoding='utf-8', errors='replace') as fh:
+                        for row in _csv.DictReader(fh):
+                            c = row.get('confidence','LOW')
+                            conf_counts[c] = conf_counts.get(c, 0) + 1
+                            m = row.get('method','')[:40]
+                            method_counts[m] = method_counts.get(m, 0) + 1
+                except Exception:
+                    pass
+            if conf_counts:
+                parts = []
+                for c in ('CONFIRMED','HIGH','MEDIUM','LOW'):
+                    if conf_counts.get(c):
+                        col = _CONF_COLOR.get(c, C.GREY)
+                        parts.append(f"{col}{conf_counts[c]} {c}{C.RESET}")
+                print(f"  total findings:  {'  |  '.join(parts)}")
+            if method_counts:
+                top_methods = sorted(method_counts.items(), key=lambda x: -x[1])[:8]
+                print(f"  top methods:     {',  '.join('%s(%d)' % (m, n) for m,n in top_methods)}")
+        print()
 
 def run_from_file(filepath, flags, output_base, wordlist,
                   quiet=False, nodelay=False, save_json=False,
@@ -8092,7 +9494,10 @@ def run_from_file(filepath, flags, output_base, wordlist,
 
     run_dir = make_run_dir(output_base, source)
     if not quiet:
-        print_results(findings, source, len(raw_bytes), verbose=True, nocolor=flags.get('nocolor', False))
+        if flags.get('analyst'):
+            print_results_analyst(findings, source, len(raw_bytes))
+        else:
+            print_results(findings, source, len(raw_bytes), verbose=flags.get('verbose', False), nocolor=flags.get('nocolor', False))
     saved_files = _save_findings(findings, flags, run_dir, source)
     _write_report(findings, source, raw_bytes[:MAX_REPORT_STRING_LEN].decode('latin-1', errors='ignore'), saved_files, flags, run_dir, save_json, quiet)
     if findings and (not quiet) and flags.get('explain'):
@@ -8135,7 +9540,10 @@ def run_from_url(url, flags, output_base, wordlist,
     source = f'URL:{url}'
     run_dir = make_run_dir(output_base, url)
     if not quiet:
-        print_results(findings, url, len(fetch.raw_bytes), verbose=True, nocolor=flags.get('nocolor', False))
+        if flags.get('analyst'):
+            print_results_analyst(findings, url, len(fetch.raw_bytes))
+        else:
+            print_results(findings, url, len(fetch.raw_bytes), verbose=flags.get('verbose', False), nocolor=flags.get('nocolor', False))
     saved_files = _save_findings(findings, flags, run_dir, source)
     if findings and (not quiet) and flags.get('explain'):
         _print_explain_top(findings)
@@ -8165,7 +9573,13 @@ def run_analysis(input_data, source_label, flags, output_base,
     findings = engine.analyze_string(input_data, source_label)
     run_dir = make_run_dir(output_base, source_label)
     if not quiet:
-        print_results(findings, source_label, len(input_data), verbose=True)
+        if flags.get('analyst'):
+            print_results_analyst(findings, source_label, len(input_data))
+        else:
+            print_results(findings, source_label, len(input_data),
+                          verbose=flags.get('verbose', False))
+        if flags.get('debug_passes'):
+            _print_pass_timing()
         if flags.get('explain'):
             _print_explain_top(findings)
     saved_files = _save_findings(findings, flags, run_dir, source_label)
@@ -8262,12 +9676,27 @@ def _print_explain_top(findings, limit=5):
             print(f"      chain: {ch}")
 
 def _print_modes():
-    _print_modes()
-    print('    --full-nasty        expand brute depth, key estimation, layered search, and artifact recursion')
+    print('  --profile ctf        broad, fast, all families active')
+    print('  --profile stego      image/file steganography focus')
+    print('  --profile forensics  DFIR — full passes, all IOCs, verbose')
+    print('  --profile triage     fast first-pass, shallow depth')
+    print('  --profile deep       maximum depth, slow, thorough')
+    print('  --profile low-noise  high-confidence findings only')
+    print('  --profile analyst    IOC-first, evidence-grade, defensible output')
+    print()
+    print('  --debug-passes       show per-pass timing after analysis')
+    print('  --out-jsonl PATH     write findings as JSONL (pipeline-friendly)')
+    print('  --out-html  PATH     write portable HTML investigation report')
+    print('  --list-profiles      show all profiles and exit')
 
 def _print_decoders():
-    _print_decoders()
-    print('    full nasty build adds stronger vigenere recovery, affine ranking, transposition hints, sidecar saves, and child-artifact awareness')
+    print('  encoding : base64/32/16/8/2, base58/62/85/91/92, url, html, uuencode')
+    print('  classical: rot 1-25, atbash, vigenere (auto key recovery), affine, bacon')
+    print('             rail fence, polybius, tap code, nihilist, playfair, ADFGVX')
+    print('  stego    : PNG LSB R/G/B/A, JPEG DCT/COM/EXIF, visual bg/alpha/strided')
+    print('  binary   : XOR single-byte, repeating-key (Hamming), chain analysis')
+    print('  file     : magic bytes (41 types), embedded carving, PE/ELF/PDF triage')
+    print('  IOC      : IPv4/6, URLs, emails, JWTs, PEM blocks, hashes, commands')
 
 def print_help():
     help_text = f"""
@@ -8477,6 +9906,78 @@ def _read_stdin_input():
         return None
 
 
+
+# ── Triage profiles ───────────────────────────────────────────────────────
+_PROFILES = {
+    'ctf': {
+        'description': 'CTF competitions — broad, fast, noisy OK',
+        'max_depth':    5,
+        'top_n':        5,
+        'flags': {'all': True, 'stego': False, 'verbose': False},
+        'note': 'All decoder families active, stego optional, depth 5',
+    },
+    'stego': {
+        'description': 'Image/file steganography focus',
+        'max_depth':    3,
+        'top_n':        8,
+        'flags': {'stego': True, 'all': False},
+        'note': 'Stego passes prioritised; decode families still run',
+    },
+    'forensics': {
+        'description': 'DFIR / incident response — evidence discipline',
+        'max_depth':    5,
+        'top_n':        10,
+        'flags': {'all': True, 'stego': True, 'verbose': True},
+        'note': 'Full passes, verbose output, all IOCs surfaced',
+    },
+    'triage': {
+        'description': 'Fast first-pass — breadth over depth',
+        'max_depth':    2,
+        'top_n':        5,
+        'flags': {'all': True, 'stego': False, 'verbose': False},
+        'note': 'Shallow depth, fastest path to a signal',
+    },
+    'deep': {
+        'description': 'Maximum depth — slow, thorough',
+        'max_depth':    10,
+        'top_n':        None,
+        'flags': {'all': True, 'stego': True, 'verbose': True, 'deep': True},
+        'note': 'All passes, all depth, full output',
+    },
+    'low-noise': {
+        'description': 'High-confidence only — minimal false positives',
+        'max_depth':    3,
+        'top_n':        3,
+        'flags': {'all': True, 'stego': False, 'verbose': False},
+        'note': 'Tight confidence thresholds, top 3 only',
+    },
+    'analyst': {
+        'description': 'DFIR analyst — IOC-first, evidence-grade, defensible output',
+        'max_depth':    5,
+        'top_n':        10,
+        'flags': {'all': True, 'stego': True, 'verbose': False, 'analyst': True},
+        'note': 'IOC summary first, timeline, analyst narrative, JSONL auto-export',
+    },
+}
+
+def _apply_profile(profile_name: str, flags: dict, args) -> int:
+    """Apply a named profile to flags and return override max_depth."""
+    p = _PROFILES.get(profile_name)
+    if not p:
+        return getattr(args, 'depth', None) or 3
+    for k, v in p.get('flags', {}).items():
+        flags[k] = v
+    return p['max_depth']
+
+
+def _list_profiles():
+    print()
+    for name, p in _PROFILES.items():
+        print(f"  --profile {name:<12}  {p['description']}")
+        print(f"  {'':16}  depth {p['max_depth']}  top_n {str(p['top_n']):<5}  {p['note']}")
+        print()
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog='hashitout', add_help=False)
     p.add_argument('-f', '--file', metavar='PATH', nargs='+')
@@ -8495,6 +9996,16 @@ def build_parser():
     p.add_argument('--help', '-h', action='store_true')
     for flag in ('fast', 'standard', 'deep_mode', 'ctf', 'forensics', 'explain', 'list_modes', 'list_decoders', 'decode_basic', 'decode_classical', 'analyze_files', 'analyze_everything', 'try_reversed'):
         p.add_argument(f'--{flag.replace("_","-")}', dest=flag, action='store_true')
+    p.add_argument('--profile',      metavar='NAME',
+                   help='Triage profile: ctf, stego, forensics, triage, deep, low-noise, analyst')
+    p.add_argument('--debug-passes', dest='debug_passes', action='store_true',
+                   help='Show pass timing and failure info after analysis')
+    p.add_argument('--out-jsonl',    metavar='PATH',
+                   help='Write findings as JSONL (one JSON object per line)')
+    p.add_argument('--out-html',     metavar='PATH',
+                   help='Write a portable HTML investigation report')
+    p.add_argument('--list-profiles', dest='list_profiles', action='store_true',
+                   help='List available triage profiles and exit')
     return p
 
 def main():
@@ -8523,10 +10034,21 @@ def main():
         print_help()
         if not any([args.shell, args.file, args.dir, args.string, args.url, args.input_string]):
             return
-    flags = {k: getattr(args, k, False) for k in ('all','rot','base','hex','binary','morse','cipher','xor','misc','stego','deep','reverse','verbose','savefile','report','noreport','nocolor','analyst','graph','artifact_mode','key_hints','full_nasty')}
+    flags = {k: getattr(args, k, False) for k in ('all','rot','base','hex','binary','morse','cipher','xor','misc','stego','deep','reverse','verbose','savefile','report','noreport','nocolor','analyst','graph','artifact_mode','key_hints','full_nasty','debug_passes')}
     flags['explain'] = getattr(args, 'explain', False)
     _HIO_ACTIVE_FLAGS.clear(); _HIO_ACTIVE_FLAGS.update(flags)
     _apply_aliases_and_presets(args, flags)
+    # ── Profile override ─────────────────────────────────────────────────────
+    if getattr(args, 'list_profiles', False):
+        _list_profiles(); return
+    _profile_name = getattr(args, 'profile', None) or ''
+    if _profile_name:
+        _profile_depth = _apply_profile(_profile_name, flags, args)
+        if not args.quiet:
+            _pd = _PROFILES.get(_profile_name, {})
+            print(f"  {C.CYAN}[profile] {_profile_name}: {_pd.get('description', '')}{C.RESET}")
+    else:
+        _profile_depth = None
     if flags.get('full_nasty'):
         flags['cipher'] = True
         flags['xor'] = True
@@ -8547,7 +10069,7 @@ def main():
         flags['xor'] = True
     if flags.get('cipher') or flags.get('deep') or getattr(args, 'deep_mode', False) or flags.get('full_nasty'):
         print(f"  {C.YELLOW}[!] brute-force or deep analysis enabled - this may be slow on large inputs{C.RESET}")
-    max_depth = _preset_depth(args, run_all)
+    max_depth = _profile_depth or _preset_depth(args, run_all)
     if flags.get('full_nasty'):
         max_depth = max(max_depth, _FULL_NASTY_PROFILE['beam_depth'])
     stegopw_wordlist = getattr(args, 'stegopw', None)
